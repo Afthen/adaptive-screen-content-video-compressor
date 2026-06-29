@@ -24,9 +24,7 @@ Every visual and temporal encoding parameter in this pipeline is dynamically cal
 
 ### 2. B-Frame Allocations and Slicetype Bias
 - **Maximum B-Frames (`bframes`):** B-frames are scaled from a structural ceiling of 16 down to a floor of 4 based on combined change rate and entropy.
-- **Slicetype Bias (`bframe-bias`):** Employs a symmetric log-odds (logit) stability model to project temporal stability:
-  $$\text{Odds} = \frac{1.0 - \Omega}{\Omega + \epsilon}$$
-  The log-odds value is mapped via a hyperbolic tangent function ($\tanh$) and scaled to fit the `[-90, 100]` x265 CLI range to prevent driver warning states.
+- **Slicetype Bias (`bframe-bias`):** Employs a symmetric log-odds (logit) stability model to project temporal stability. The log-odds value is mapped via a hyperbolic tangent function ($\tanh$) and scaled to fit the `[-90, 100]` x265 CLI range to prevent driver warning states.
 
 ### 3. Loop Filter Deblocking Offsets (`deblock`)
 - **Method:** Balances vector text sharpness against dither-noise smoothing by applying a linear projection of change entropy (which dictates smoothing needs) against visual contrast (which dictates sharpness needs).
@@ -52,9 +50,10 @@ This classification provides the structural probability ($\Omega$) and contrast 
 
 ### 2. AR(2) Infinite-Limit Parameter Extrapolation
 During calibration sweeps, parameters such as the low block-sum threshold (`lo`) and minimum active block counts (`n`) can oscillate between iterations. To ensure mathematical convergence, the calibration engine monitors history states and projects parameter behavior to its infinite-limit fixed point using a second-order auto-regressive model with drift:
+
 $$y_n = A_1 y_{n-1} + A_2 y_{n-2} + c + \epsilon$$
 
-- **Stability Check:** The characteristic equation roots ($z^2 - A_1 z - A_2 = 0$) are evaluated. If both roots lie strictly inside the complex unit circle, the system is deemed stable (handling both monotonic and damped-oscillating convergence).
+- **Stability Check:** The characteristic equation roots (`z^2 - A1*z - A2 = 0`) are evaluated. If both roots lie strictly inside the complex unit circle, the system is deemed stable (handling both monotonic and damped-oscillating convergence).
 - **Exit Strategy:** The system early-exits when the projected infinite-limit fixed point rounds to the same integer values on consecutive sweeps, saving CPU cycles.
 
 ### 3. Algorithmic Complexity Crossover (Fast Threshold Counting)
@@ -63,15 +62,19 @@ When evaluating changes across 8x8 pixel blocks, the engine must count how many 
 2. **Suffix-Sum Bincount Method ($N + M$ complexity):** Populates a deterministic bincount of size $M$ (16,321 possible block sums) and computes a suffix sum.
 
 The crossover point occurs exactly where the computational densities intersect:
+
 $$N = \frac{M}{T - 1}$$
+
 This solves to exactly **64 blocks** (`CROSSOVER_LIMIT`). If fewer than 64 blocks are active, the broadcast model runs; otherwise, the suffix-sum method is utilized, avoiding redundant comparisons.
 
 ### 4. Gradient-Based Visual Cleanliness Scoring
 When duplicating repeated visual states across decimation intervals, the pipeline evaluates each candidate frame's spatial gradients to select the cleanest frame to write.
-- **Noise Energy:** Sums absolute horizontal and vertical pixel-to-pixel differences that fall below a dynamically calibrated noise threshold ($t_{\text{noise}} \le T_{\text{low}} / 64$, where $T_{\text{low}}$ represents the calibrated `best_lo` value).
-- **Edge Energy:** Sums gradient changes that fall above a dynamic edge threshold ($t_{\text{edge}} \ge 6 \times t_{\text{noise}}$).
+- **Noise Energy:** Sums absolute horizontal and vertical pixel-to-pixel differences that fall below a dynamically calibrated noise threshold (`t_noise <= best_lo / 64`).
+- **Edge Energy:** Sums gradient changes that fall above a dynamic edge threshold (`t_edge >= 6 * t_noise`).
 - **Objective Score:** Employs a regularized minimization objective:
+
   $$\text{Score} = \text{Noise Energy} - (\alpha \times \text{Edge Energy})$$
+
   The frame with the lowest score (representing minimal sub-pixel noise and maximum edge sharpness) is preserved.
 
 ---
