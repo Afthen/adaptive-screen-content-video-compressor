@@ -68,7 +68,7 @@ This solves to exactly **64 blocks** (`CROSSOVER_LIMIT`). If fewer than 64 block
 
 ### 4. Gradient-Based Visual Cleanliness Scoring
 When duplicating repeated visual states across decimation intervals, the pipeline evaluates each candidate frame's spatial gradients to select the cleanest frame to write.
-- **Noise Energy:** Sums absolute horizontal and vertical pixel-to-pixel differences that fall below a dynamically calibrated noise threshold ($t_{\text{noise}} \le \frac{\text{best\_lo}}{64}$).
+- **Noise Energy:** Sums absolute horizontal and vertical pixel-to-pixel differences that fall below a dynamically calibrated noise threshold ($t_{\text{noise}} \le T_{\text{low}} / 64$, where $T_{\text{low}}$ represents the calibrated `best_lo` value).
 - **Edge Energy:** Sums gradient changes that fall above a dynamic edge threshold ($t_{\text{edge}} \ge 6 \times t_{\text{noise}}$).
 - **Objective Score:** Employs a regularized minimization objective:
   $$\text{Score} = \text{Noise Energy} - (\alpha \times \text{Edge Energy})$$
