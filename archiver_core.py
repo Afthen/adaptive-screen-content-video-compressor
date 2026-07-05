@@ -616,6 +616,13 @@ def calculate_radiometric_constants_raw(counts_data, mag_hist, g_active, g_total
     # Map best_hi to a mathematically derived contrast boundary instead of locking it to MAX_PHYSICAL_HI
     best_hi = min(float(MAX_PHYSICAL_HI), max(float(best_lo * 1.5), float(m_classes[2])))
 
+    # Calculate spatial-temporal entropy metrics
+    p_nonzero = g_active / g_total
+
+    # omega_metric tracks structural macro-change probability (Class 2)
+    omega_metric = p_nonzero * omega_classes[2]
+    phi_metric = 1.0 - (m_classes[0] / (m_classes[2] + EPSILON))
+
     # Match float threshold to closest threshold index
     lo_idx = np.argmin(np.abs(THRESHOLDS - best_lo))
     frame_activity_counts = counts_data[:, lo_idx]
