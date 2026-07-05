@@ -529,9 +529,8 @@ def profile_video_sweep(input_file, keep_intervals, width, height):
     try:
         with av.open(input_file) as kf_container:
             v_stream_kf = kf_container.streams.video[0]
-            # demux only yields packets, avoiding any video frame decoding
+            # Demux only yields packet headers, bypassing video decoding completely
             for packet in kf_container.demux(v_stream_kf):
-                # Ignore flushing / dummy packets that don't have timestamps
                 if packet.pts is None:
                     continue
                 if packet.is_keyframe:
@@ -541,7 +540,7 @@ def profile_video_sweep(input_file, keep_intervals, width, height):
         print(f"  > Warning: Rapid keyframe pre-scan failed ({e}). Falling back to empty GOP map.")
         kf_times = []
 
-    # Ensure times are sorted (some container types may occasionally yield slightly out-of-order DTS)
+    # Ensure times are sorted for correct binary search partitioning
     kf_times.sort()
 
     total_blocks = (width // 8) * (height // 8)
@@ -549,54 +548,49 @@ def profile_video_sweep(input_file, keep_intervals, width, height):
     def extrapolate_infinite_limit(seq, min_val=0, max_val=MAX_BLOCK_SUM):
         """
         Extrapolates parameter patterns into their infinite-limit values using
-        second-order auto-regression (AR(2)) with drift. Replaces the previous
-        AR(1) model, which required monotonic convergence and broke on damped
-        oscillation. AR(2) stability is checked via the roots of the characteristic
-        polynomial — sequences that converge via damped oscillation are handled
-        correctly without needing a separate oscillation-detection guard.
+        second-order auto-regression (AR(2)) with drift. Stability is verified
+        via the roots of the characteristic polynomial.
+
+        Returns:
+            (limit, steps) if a stable, convergent AR(2) fit is found.
+            (None, None) if history is too short, fit is low-rank, or the sequence
+                         is locally unstable (e.g., accelerating).
         """
-        # AR(2) with intercept needs n-2 samples >= 3 unknowns (A1, A2, c),
-        # so a minimum of 5 history points is required.
+        # AR(2) with intercept needs n-2 samples >= 3 unknowns (A1, A2, c)
         if len(seq) < 5:
-            return seq[-1], 0
+            return None, None
 
         y = np.array(seq, dtype=np.float64)
 
         # Two-lag design matrix with intercept column: [y[n-1], y[n-2], 1] -> y[n]
-        # Full AR(2) with drift: y[n] = A1*y[n-1] + A2*y[n-2] + c + eps
         X = np.column_stack([y[1:-1], y[:-2], np.ones(len(y) - 2)])
         Y = y[2:]
 
-        # OLS via least-squares (robust to near-singular or exactly-determined cases)
+        # OLS via least-squares
         coeffs, _, rank, _ = np.linalg.lstsq(X, Y, rcond=None)
         if rank < 3:
-            return seq[-1], 0
+            return None, None
 
         A1, A2, c = coeffs
 
-        # AR(2) stability: both roots of z^2 - A1*z - A2 = 0 must lie inside the
-        # unit circle. This covers monotonic convergence (real roots < 1) AND damped
-        # oscillation (complex conjugate roots with |z| < 1), replacing the old
-        # 0.0 < A < 1.0 guard which rejected all oscillating sequences outright.
+        # Stability check: both roots of z^2 - A1*z - A2 = 0 must lie inside the unit circle
         roots = np.roots([1, -A1, -A2])
         if not np.all(np.abs(roots) < 1.0):
-            return seq[-1], 0
+            return None, None
 
         # AR(2) fixed point: y* = c / (1 - A1 - A2)
         denom = 1.0 - A1 - A2
         if abs(denom) < 1e-8:
-            return seq[-1], 0
+            return None, None
 
         limit = c / denom
         if not (min_val <= limit <= max_val):
-            return seq[-1], 0
+            return None, None
 
         current_val = seq[-1]
         distance = abs(current_val - limit)
 
-        # Step estimate uses the spectral radius (dominant root magnitude) as the
-        # convergence rate — valid for both real and complex roots. Replaces log(A)
-        # from the AR(1) model.
+        # Step estimate uses spectral radius (dominant root magnitude) as the convergence rate
         spectral_radius = np.max(np.abs(roots))
         if distance > 0.5 and spectral_radius > EPSILON:
             steps = int(np.ceil(np.log(0.5 / distance) / np.log(spectral_radius)))
@@ -739,7 +733,6 @@ def profile_video_sweep(input_file, keep_intervals, width, height):
         counts_data = np.vstack(f_stats) if f_stats else np.empty((0, len(THRESHOLDS)))
 
         # Retrieve new metrics including normalized entropy
-        # Note: Unused g_frm (g_frames) removed from signature
         hi_new, lo_new, n_new, separability, omega_metric, phi_metric, norm_entropy_new = calculate_radiometric_constants_raw(
             counts_data, global_mag_hist, g_act, g_tot
         )
@@ -748,7 +741,7 @@ def profile_video_sweep(input_file, keep_intervals, width, height):
             'separability': separability,
             'omega_metric': omega_metric,
             'phi_metric': phi_metric,
-            'norm_entropy': norm_entropy_new,  # Cache the calculated entropy
+            'norm_entropy': norm_entropy_new,
             'activity_log': global_activity_log,
             'g_act': g_act,
             'g_tot': g_tot,
@@ -788,35 +781,42 @@ def profile_video_sweep(input_file, keep_intervals, width, height):
         )
 
         # AR(2) Convergence Check
-        # Oscillation detection is removed — AR(2) handles damped oscillation
-        # natively via the characteristic-polynomial stability check. The sole
-        # early-exit criterion is the extrapolated fixed point rounding to the
-        # same integer on two consecutive iterations.
-        if len(lo_history) >= 5:  # Minimum for AR(2) with intercept (3 unknowns)
+        if len(lo_history) >= 5:
             lo_est, lo_steps = extrapolate_infinite_limit(lo_history, min_val=MIN_PHYSICAL_LO)
             n_est, n_steps = extrapolate_infinite_limit(n_history, max_val=total_blocks)
 
-            lo_est_rounded = int(round(lo_est))
-            n_est_rounded = int(round(n_est))
+            # Evaluate and compare only if both models have established stable tracking
+            if lo_est is not None and n_est is not None:
+                lo_est_rounded = int(round(lo_est))
+                n_est_rounded = int(round(n_est))
 
-            print(f"    > Current Projection L(n): LO={lo_est}≈{lo_est_rounded} (est. {lo_steps} iters) | "
-                  f"n={n_est}≈{n_est_rounded} (est. {n_steps} iters)")
+                print(f"    > Current Projection L(n): LO={safe_float(lo_est)}≈{lo_est_rounded} (est. {lo_steps} iters) | "
+                      f"n={safe_float(n_est)}≈{n_est_rounded} (est. {n_steps} iters)")
 
-            if prev_extrapolated_lo is not None and prev_extrapolated_n is not None:
-                if lo_est_rounded == prev_extrapolated_lo and n_est_rounded == prev_extrapolated_n:
-                    print(
-                        f"    - Extrapolated limit converged early at Iteration {iter_idx + 1} (LO={lo_est_rounded}, n={n_est_rounded}). Halting loop.")
-                    break
+                # Verify if the rounded projections match across consecutive iterations
+                if prev_extrapolated_lo is not None and prev_extrapolated_n is not None:
+                    if lo_est_rounded == prev_extrapolated_lo and n_est_rounded == prev_extrapolated_n:
+                        print(
+                            f"    - Extrapolated limit converged early at Iteration {iter_idx + 1} (LO={lo_est_rounded}, n={n_est_rounded}). Halting loop.")
+                        break
 
-            prev_extrapolated_lo = lo_est_rounded
-            prev_extrapolated_n = n_est_rounded
+                prev_extrapolated_lo = lo_est_rounded
+                prev_extrapolated_n = n_est_rounded
+            else:
+                # Accurate reporting during local acceleration states
+                print("    > Current Projection L(n): Gathering stable history (Extrapolation Unstable/Unavailable)")
+                # Reset buffers to prevent comparisons across discontinuous unstable phases
+                prev_extrapolated_lo = None
+                prev_extrapolated_n = None
 
+    # Final infinite-limit calculations
     lo_extrapolated, _ = extrapolate_infinite_limit(lo_history, min_val=MIN_PHYSICAL_LO)
     n_blocks_extrapolated, _ = extrapolate_infinite_limit(n_history, max_val=total_blocks)
 
-    best_lo = int(round(lo_extrapolated))
+    # Use the stable extrapolation if found; otherwise, fall back safely to the last empirical iteration
+    best_lo = int(round(lo_extrapolated)) if lo_extrapolated is not None else int(round(lo_history[-1]))
     best_hi = MAX_PHYSICAL_HI
-    best_n = int(round(n_blocks_extrapolated))
+    best_n = int(round(n_blocks_extrapolated)) if n_blocks_extrapolated is not None else int(round(n_history[-1]))
 
     print(f"\n  > Global Sequence Extrapolation Successful.")
     print(f"  > Infinite-Limit Fixed Point: LO={best_lo}, HI={best_hi} (Locked), n={best_n}")
@@ -824,7 +824,7 @@ def profile_video_sweep(input_file, keep_intervals, width, height):
     separability = last_iter_metrics['separability']
     omega_metric = last_iter_metrics['omega_metric']
     phi_metric = last_iter_metrics['phi_metric']
-    norm_entropy = last_iter_metrics['norm_entropy']  # Extract cached value
+    norm_entropy = last_iter_metrics['norm_entropy']
     activity_log = last_iter_metrics['activity_log']
     g_tot = last_iter_metrics['g_tot']
     g_frm = last_iter_metrics['g_frm']
