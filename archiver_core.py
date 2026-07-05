@@ -678,7 +678,7 @@ def profile_video_sweep(input_file, keep_intervals, width, height):
     prev_extrapolated_n = None
     hi = float(MAX_PHYSICAL_HI)
     lo, n_blocks = 0.0, 0.0
-    max_iters = 16
+    max_iters = 32
     relaxation_damping = 2.0 / 3.0
     static_chunks = set()
 
