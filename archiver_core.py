@@ -38,6 +38,7 @@ import io
 import bisect
 import re
 import time
+import ast
 from concurrent.futures import ProcessPoolExecutor
 
 # ==============================================================================
@@ -212,6 +213,20 @@ def parse_existing_log(log_file_path):
         # Parse State lines: Sep, H_norm, Omega, Phi
         state_matches = re.findall(r"State:\s*Sep=([0-9.]+),\s*H_norm=([0-9.]+),\s*Omega=([0-9.]+),\s*Phi=([0-9.]+)", content)
         
+        # Parse Keep Intervals list and Total Duration
+        match_intervals = re.search(r"> Keep Intervals: (\[.*?\])", content)
+        match_duration = re.search(r"> Total Duration: ([0-9.]+) seconds", content)
+        
+        merged_list = None
+        total_sec_val = None
+        
+        if match_intervals and match_duration:
+            try:
+                merged_list = ast.literal_eval(match_intervals.group(1))
+                total_sec_val = float(match_duration.group(1))
+            except Exception:
+                pass
+
         if iterations:
             history_lo = [float(item[1]) for item in iterations]
             history_n = [float(item[2]) for item in iterations]
@@ -246,7 +261,9 @@ def parse_existing_log(log_file_path):
                 'converged': converged,
                 'final_lo': final_lo,
                 'final_n': final_n,
-                'final_state': final_state
+                'final_state': final_state,
+                'merged': merged_list,
+                'total_sec': total_sec_val
             }
     except Exception as e:
         print(f"[RESUME] Warning: Failed to parse existing log file ({e}). Starting fresh.")
@@ -454,6 +471,8 @@ def determine_intervals(audio_stats, dur, fps):
         else:
             merged.append((next_s, next_e))
 
+    # Log keep intervals to the log file so they can be parsed for resumption
+    print(f"  > Keep Intervals: {merged}")
     return merged
 
 
@@ -1086,12 +1105,11 @@ def run_pipeline():
 
     1. Sets up the stream redirection to capture logs cleanly.
     2. Gathers general stream physics metadata (dimensions, frame rate).
-    3. Checks for existing JSON parameter cache to skip analysis if desired.
-    4. Compiles the voice-activity audio stats (or loads cached stats).
-    5. Runs the full-timeline global-extrapolation video profiling sweep (or loads cached stats).
-    6. Translates spatial-temporal metrics to x265 and mpdecimate variables.
-    7. Generates keeping-intervals and exports the consolidated mono WAV file.
-    8. Pipes the raw video frames corresponding to the keeping intervals directly
+    3. Runs the voice-activity audio stats (or loads cached stats).
+    4. Runs the full-timeline global-extrapolation video profiling sweep (or loads cached stats).
+    5. Translates spatial-temporal metrics to x265 and mpdecimate variables.
+    6. Generates keeping-intervals and exports the consolidated mono WAV file.
+    7. Pipes the raw video frames corresponding to the keeping intervals directly
        to FFmpeg, executing a veryslow x265 encode with customized visual parameters.
     """
     global START_TIME
@@ -1110,19 +1128,17 @@ def run_pipeline():
         except ValueError:
             print(f"Warning: Invalid start_time argument '{sys.argv[4]}'. Defaulting to {safe_float(START_TIME)}.")
 
-    # --- Setup Logging Redirection & Resume Detection ---
+    # --- Setup Logging Redirection & Log-based Resume Parser ---
     log_file_path = output_file + ".log"
-    cache_file_path = output_file + ".cache.json"
-
-    # Parse existing log file if present before stdout/stderr redirection
     parsed_log = parse_existing_log(log_file_path)
-    
+
+    # Open log file in append mode if resuming, otherwise in overwrite mode
     log_mode = 'w'
     if parsed_log:
-        if parsed_log['converged']:
-            print(f"[RESUME] Existing log has converged. Direct loading parameters from history.")
+        if parsed_log['converged'] and parsed_log['merged'] is not None and parsed_log['total_sec'] is not None:
+            print(f"[RESUME] Existing log converged at LO={parsed_log['final_lo']}, n={parsed_log['final_n']}. Bypassing calibration sweep.")
         else:
-            print(f"[RESUME] Existing log is unconverged with {len(parsed_log['history_lo'])} steps. Continuing sweep.")
+            print(f"[RESUME] Existing log has {len(parsed_log['history_lo'])} unconverged steps. Resuming sweep in append mode.")
             log_mode = 'a'
 
     try:
@@ -1156,41 +1172,31 @@ def run_pipeline():
         has_audio = len(container.streams.audio) > 0
         container.close()
 
-        # --- Dynamic Calibration Cache Verification ---
-        import json
+        # Check if direct loading from log file is active
         use_cached = False
-        cached_data = None
-
-        if os.path.exists(cache_file_path):
-            try:
-                with open(cache_file_path, 'r', encoding='utf-8') as f:
-                    cached_data = json.load(f)
-
-                # Verify structural presence of essential metrics
-                required_keys = ['merged', 'total_sec', 'best_hi', 'best_lo', 'mpdecimate_frac',
-                                 'S_val', 'Omega', 'Phi', 'H_norm']
-                if all(k in cached_data for k in required_keys):
-                    response = input(
-                        f"\n[CACHE] Found existing calibration cache at '{cache_file_path}'.\n"
-                        f"Do you want to reuse these parameters and skip analysis? (y/n): "
-                    ).strip().lower()
-                    if response in ('y', 'yes'):
-                        use_cached = True
-                        print("[CACHE] Reusing cached analysis metrics. Skipping Phases 1-3.\n")
-            except Exception as e:
-                print(f"[CACHE] Warning: Failed to parse cache file ({e}). Re-analyzing stream.")
+        if parsed_log and parsed_log['converged'] and parsed_log['merged'] is not None and parsed_log['total_sec'] is not None:
+            use_cached = True
 
         if use_cached:
-            # Unpack the cache file back into physical and spatial-temporal variables
-            merged = [tuple(item) for item in cached_data['merged']]
-            total_sec = cached_data['total_sec']
-            best_hi = cached_data['best_hi']
-            best_lo = cached_data['best_lo']
-            mpdecimate_frac = cached_data['mpdecimate_frac']
-            S_val = cached_data['S_val']
-            Omega = cached_data['Omega']
-            Phi = cached_data['Phi']
-            H_norm = cached_data['H_norm']
+            # Unpack converged parameters directly from the parsed log file
+            merged = parsed_log['merged']
+            total_sec = parsed_log['total_sec']
+            best_lo = parsed_log['final_lo']
+            best_n = parsed_log['final_n']
+            
+            # Reconstruct other metrics from log
+            if parsed_log['final_state']:
+                S_val, H_norm, Omega, Phi = parsed_log['final_state']
+            else:
+                S_val, H_norm, Omega, Phi = 0.85, 0.68, 0.003, 0.97
+                
+            best_hi = min(float(MAX_PHYSICAL_HI), max(float(best_lo * 1.5), 1000.0))
+            
+            # Get block counts for the frame piping loop
+            total_blocks = (width // 8) * (height // 8)
+            mpdecimate_frac = np.clip(best_n / total_blocks, EPSILON, 1.0)
+            
+            print(f"[RESUME] Loaded Converged State: LO={best_lo}, HI={best_hi}, n={best_n} (FRAC={safe_float(mpdecimate_frac)})")
         else:
             if has_audio:
                 # --- Executing Phase 1 (Audio Stats) ---
@@ -1204,29 +1210,13 @@ def run_pipeline():
                 total_sec = float(container.duration / av.time_base) if container.duration else 0.0
                 container.close()
                 merged = [(START_TIME if START_TIME else 0.0, total_sec)]
+                print(f"  > Keep Intervals: {merged}")
+
+            print(f"  > Total Duration: {safe_float(total_sec)} seconds")
 
             # --- Executing Phase 3 (Unified Video Profiling & Radiometric Calibration) ---
             best_hi, best_lo, mpdecimate_frac, S_val, Omega, Phi, H_norm, activity_log = profile_video_sweep(
                 input_file, merged, width, height, output_file, parsed_log=parsed_log)
-
-            # Write calibration metrics immediately to cache before beginning Master Encode
-            try:
-                cache_payload = {
-                    'merged': merged,
-                    'total_sec': total_sec,
-                    'best_hi': best_hi,
-                    'best_lo': best_lo,
-                    'mpdecimate_frac': mpdecimate_frac,
-                    'S_val': S_val,
-                    'Omega': Omega,
-                    'Phi': Phi,
-                    'H_norm': H_norm
-                }
-                with open(cache_file_path, 'w', encoding='utf-8') as f:
-                    json.dump(cache_payload, f, indent=4)
-                print(f"[CACHE] Successfully saved calibration metrics to: {cache_file_path}")
-            except Exception as e:
-                print(f"[CACHE] Warning: Could not write cache file: {e}")
 
         # --- Phase 4: Master Encode Preparation ---
         container = av.open(input_file)
