@@ -36,6 +36,8 @@ import os
 from tqdm import tqdm
 import io
 import bisect
+import re
+import time
 from concurrent.futures import ProcessPoolExecutor
 
 # ==============================================================================
@@ -149,6 +151,110 @@ class Tee:
 
 
 # ==============================================================================
+# --- INTERACTIVE TERMINAL UTILITIES --------
+# ==============================================================================
+
+def timed_input(prompt, timeout):
+    """
+    Cross-platform non-blocking timed input.
+    Returns the user's string input if entered, or None if the timeout expires.
+    """
+    print(prompt, end='', flush=True)
+    
+    if sys.platform == 'win32':
+        import msvcrt
+        start_time = time.time()
+        input_chars = []
+        while time.time() - start_time < timeout:
+            if msvcrt.kbhit():
+                char = msvcrt.getwche()  # Read character with console echo
+                if char in ('\r', '\n'):  # Enter key pressed
+                    print()  # Advance to next line
+                    return ''.join(input_chars)
+                elif char == '\b':  # Backspace
+                    if input_chars:
+                        input_chars.pop()
+                        # Erase character visually from console
+                        print(' \b', end='', flush=True)
+                else:
+                    input_chars.append(char)
+            time.sleep(0.05)
+        print("\n\n[Timeout] No input received. Proceeding automatically...")
+        return None
+    else:
+        import select
+        # Unix-like select stream listener
+        rlist, _, _ = select.select([sys.stdin], [], [], timeout)
+        if rlist:
+            return sys.stdin.readline().strip()
+        else:
+            print("\n\n[Timeout] No input received. Proceeding automatically...")
+            return None
+
+
+def parse_existing_log(log_file_path):
+    """
+    Parses an existing log file to extract high-precision history and check convergence.
+    """
+    if not os.path.exists(log_file_path):
+        return None
+        
+    try:
+        with open(log_file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+            
+        # Parse all past iteration parameters: LO, n
+        iterations = re.findall(r"-\s*Iteration\s*(\d+):.*?Parameters:\s*LO=([0-9.]+).*?n=([0-9.]+)", content, re.DOTALL)
+        
+        # Parse all past raw float projections
+        projections = re.findall(r"Current Projection L\(n\):\s*LO=([0-9.]+).*?n=([0-9.]+)", content)
+        
+        # Parse State lines: Sep, H_norm, Omega, Phi
+        state_matches = re.findall(r"State:\s*Sep=([0-9.]+),\s*H_norm=([0-9.]+),\s*Omega=([0-9.]+),\s*Phi=([0-9.]+)", content)
+        
+        if iterations:
+            history_lo = [float(item[1]) for item in iterations]
+            history_n = [float(item[2]) for item in iterations]
+            
+            converged = False
+            final_lo, final_n = None, None
+            final_state = None
+            
+            # Check for convergence using Banker's rounded values of raw float projections
+            if len(projections) >= 2:
+                last_lo = float(projections[-1][0])
+                last_n = float(projections[-1][1])
+                second_last_lo = float(projections[-2][0])
+                second_last_n = float(projections[-2][1])
+                
+                # Apply Python's native Banker's rounding (round-to-even)
+                last_lo_rounded = int(round(last_lo))
+                last_n_rounded = int(round(last_n))
+                second_last_lo_rounded = int(round(second_last_lo))
+                second_last_n_rounded = int(round(second_last_n))
+                
+                if last_lo_rounded == second_last_lo_rounded and last_n_rounded == second_last_n_rounded:
+                    converged = True
+                    final_lo = last_lo_rounded
+                    final_n = last_n_rounded
+                    if state_matches:
+                        final_state = [float(x) for x in state_matches[-1]]
+                        
+            return {
+                'history_lo': history_lo,
+                'history_n': history_n,
+                'converged': converged,
+                'final_lo': final_lo,
+                'final_n': final_n,
+                'final_state': final_state
+            }
+    except Exception as e:
+        print(f"[RESUME] Warning: Failed to parse existing log file ({e}). Starting fresh.")
+        
+    return None
+
+
+# ==============================================================================
 # --- MATHEMATICAL CLASS SEPARATION --------
 # ==============================================================================
 
@@ -158,11 +264,6 @@ def perform_otsu_sweep(data, weights=None):
 
     Splits a 1D probability distribution into three distinct, mathematically
     optimal classes by maximizing the between-class variance (minimizing intra-class variance).
-
-    This classification is a cornerstone of the screen archiving pipeline:
-      - Class 0 (Background Noise): Contains sub-pixel luma fluctuations, sensor/dither noise.
-      - Class 1 (Micro-Changes): Represents cursor blinking, pulsing microphone indicators, UI hover states.
-      - Class 2 (Macro-Changes): Represents critical visual updates like typing new text, drawing lines, or slide transitions.
     """
     if data.size == 0:
         return 0.0, 0.0, 0.0, (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)
@@ -397,10 +498,13 @@ def worker_analyze_sweep(args):
                 if ts > end_time: break  # Cease decoding when exceeding chunk boundary
                 local_frames_processed += 1
 
-                # Access the raw Y (Luma) plane directly.
+                # Access the raw Y (Luma) plane safely depending on format
                 plane = frame.planes[0]
-                arr = np.frombuffer(plane, np.uint8).reshape(plane.height, plane.line_size)
-                curr_frame = arr[:, :plane.width].astype(np.int16)
+                if len(frame.planes) > 1: # Standard planar YUV (yuv420p, yuv422p, yuv444p)
+                    arr = np.frombuffer(plane, np.uint8).reshape(plane.height, plane.line_size)
+                    curr_frame = arr[:, :plane.width].astype(np.int16)
+                else: # Packed format (RGB, BGR, Grayscale, etc.)
+                    curr_frame = extract_luma_from_ndarray(frame.to_ndarray(), plane.height, plane.width)
 
                 if ref_frame is None:
                     ref_frame = curr_frame
@@ -490,15 +594,8 @@ def calculate_radiometric_constants_raw(counts_data, mag_hist, g_active, g_total
     # Map LO to the higher Otsu threshold (t2)
     best_lo = max(float(MIN_PHYSICAL_LO), float(t2))
 
-    # Physically lock HI to the maximum block sum (16320)
-    best_hi = float(MAX_PHYSICAL_HI)
-
-    # Calculate spatial-temporal entropy metrics
-    p_nonzero = g_active / g_total
-
-    # omega_metric tracks structural macro-change probability (Class 2)
-    omega_metric = p_nonzero * omega_classes[2]
-    phi_metric = 1.0 - (m_classes[0] / (m_classes[2] + EPSILON))
+    # Map best_hi to a mathematically derived contrast boundary instead of locking it to MAX_PHYSICAL_HI
+    best_hi = min(float(MAX_PHYSICAL_HI), max(float(best_lo * 1.5), float(m_classes[2])))
 
     # Match float threshold to closest threshold index
     lo_idx = np.argmin(np.abs(THRESHOLDS - best_lo))
@@ -514,7 +611,7 @@ def calculate_radiometric_constants_raw(counts_data, mag_hist, g_active, g_total
     return best_hi, best_lo, n_blocks, separability, omega_metric, phi_metric, norm_entropy
 
 
-def profile_video_sweep(input_file, keep_intervals, width, height):
+def profile_video_sweep(input_file, keep_intervals, width, height, output_file, parsed_log=None):
     """
     Core Search, Convergence, and Radiometric Extraction Engine.
 
@@ -544,6 +641,26 @@ def profile_video_sweep(input_file, keep_intervals, width, height):
     kf_times.sort()
 
     total_blocks = (width // 8) * (height // 8)
+
+    # ==========================================================================
+    # --- RESUME POINT CHECK: DIRECT LOAD ---
+    # ==========================================================================
+    if parsed_log and parsed_log['converged']:
+        best_lo = parsed_log['final_lo']
+        best_hi = min(float(MAX_PHYSICAL_HI), max(float(best_lo * 1.5), 1000.0))  # Dynamic boundary fallback
+        best_n = parsed_log['final_n']
+        
+        # Restore saved state from log file
+        if parsed_log['final_state']:
+            separability, norm_entropy, omega_metric, phi_metric = parsed_log['final_state']
+        else:
+            separability, norm_entropy, omega_metric, phi_metric = 0.85, 0.68, 0.003, 0.97
+            
+        mpdecimate_frac = np.clip(best_n / total_blocks, EPSILON, 1.0)
+        
+        print(f"\n[RESUME] Native Convergence Found in Log. Direct Loading Parameters:")
+        print(f"  > Parameters: LO={best_lo}, HI={best_hi}, n={best_n} (FRAC={safe_float(mpdecimate_frac)})")
+        return best_hi, best_lo, mpdecimate_frac, separability, omega_metric, phi_metric, norm_entropy, []
 
     def extrapolate_infinite_limit(seq, min_val=0, max_val=MAX_BLOCK_SUM):
         """
@@ -672,15 +789,31 @@ def profile_video_sweep(input_file, keep_intervals, width, height):
         f"  > Divided keep intervals ({safe_float(total_keep_dur)}s active) into {len(groups)} hardware-scaled segments "
         f"({num_workers} workers, avg chunk: {safe_float(avg_chunk_dur)}s)...")
 
+    # ==========================================================================
+    # --- RESUME POINT CHECK: HISTORY INJECTION ---
+    # ==========================================================================
     lo_history = []
     n_history = []
+    start_iter_idx = 0
+    lo, n_blocks = 0.0, 0.0
+
+    if parsed_log and not parsed_log['converged']:
+        lo_history = list(parsed_log['history_lo'])
+        n_history = list(parsed_log['history_n'])
+        start_iter_idx = len(lo_history)
+        
+        # Seed parameters with the last unconverged values from the log file
+        lo = lo_history[-1]
+        n_blocks = n_history[-1]
+        print(f"  > Pre-loaded {start_iter_idx} steps of historical AR(2) metrics from log.")
+
     prev_extrapolated_lo = None
     prev_extrapolated_n = None
     hi = float(MAX_PHYSICAL_HI)
-    lo, n_blocks = 0.0, 0.0
-    max_iters = 32
+    max_iters_current = 24  # Base maximum iterations
     relaxation_damping = 2.0 / 3.0
     static_chunks = set()
+    iter_durations = []
 
     # Guard metric fallback definitions to protect against empty iteration sets
     last_iter_metrics = {
@@ -694,7 +827,9 @@ def profile_video_sweep(input_file, keep_intervals, width, height):
         'g_frm': 0
     }
 
-    for iter_idx in range(max_iters):
+    iter_idx = start_iter_idx
+    while iter_idx < max_iters_current:
+        iter_start = time.time()
         active_tasks = []
         task_mapping = []
 
@@ -780,28 +915,35 @@ def profile_video_sweep(input_file, keep_intervals, width, height):
             f"Omega={safe_float(omega_metric)}, Phi={safe_float(phi_metric)}"
         )
 
-        # AR(2) Convergence Check
+        converged_early = False
         if len(lo_history) >= 5:
             lo_est, lo_steps = extrapolate_infinite_limit(lo_history, min_val=MIN_PHYSICAL_LO)
             n_est, n_steps = extrapolate_infinite_limit(n_history, max_val=total_blocks)
 
             # Evaluate and compare only if both models have established stable tracking
             if lo_est is not None and n_est is not None:
+                # Log raw, unrounded floating point values to protect precision
+                print(f"    > Current Projection L(n): LO={safe_float(lo_est)} (est. {lo_steps} iters) | "
+                      f"n={safe_float(n_est)} (est. {n_steps} iters)")
+
+                # Perform Banker's rounded comparison for early-exit evaluation
                 lo_est_rounded = int(round(lo_est))
                 n_est_rounded = int(round(n_est))
 
-                print(f"    > Current Projection L(n): LO={safe_float(lo_est)}≈{lo_est_rounded} (est. {lo_steps} iters) | "
-                      f"n={safe_float(n_est)}≈{n_est_rounded} (est. {n_steps} iters)")
-
-                # Verify if the rounded projections match across consecutive iterations
                 if prev_extrapolated_lo is not None and prev_extrapolated_n is not None:
-                    if lo_est_rounded == prev_extrapolated_lo and n_est_rounded == prev_extrapolated_n:
+                    # Apply Banker's rounding to the tracked raw floats
+                    prev_lo_rounded = int(round(prev_extrapolated_lo))
+                    prev_n_rounded = int(round(prev_extrapolated_n))
+
+                    if lo_est_rounded == prev_lo_rounded and n_est_rounded == prev_n_rounded:
                         print(
                             f"    - Extrapolated limit converged early at Iteration {iter_idx + 1} (LO={lo_est_rounded}, n={n_est_rounded}). Halting loop.")
+                        converged_early = True
                         break
 
-                prev_extrapolated_lo = lo_est_rounded
-                prev_extrapolated_n = n_est_rounded
+                # Track exact floats in the buffer to avoid precision decay
+                prev_extrapolated_lo = lo_est
+                prev_extrapolated_n = n_est
             else:
                 # Accurate reporting during local acceleration states
                 print("    > Current Projection L(n): Gathering stable history (Extrapolation Unstable/Unavailable)")
@@ -809,14 +951,45 @@ def profile_video_sweep(input_file, keep_intervals, width, height):
                 prev_extrapolated_lo = None
                 prev_extrapolated_n = None
 
-    # Final infinite-limit calculations
+        # Track processing duration of this iteration
+        iter_durations.append(time.time() - iter_start)
+        iter_idx += 1
+
+        # ======================================================================
+        # --- DYNAMIC TERMINAL EXTENSION PROMPT ---
+        # ======================================================================
+        if iter_idx >= max_iters_current and not converged_early:
+            avg_dur = np.mean(iter_durations) if iter_durations else 15.0
+            
+            # Sound ANSI audio bell and print notification
+            print("\a", end='', flush=True)
+            print("\n" + "!" * 80)
+            print("!!! ATTENTION: CALIBRATION ITERATIONS REACHED LIMIT WITHOUT CONVERGENCE !!!")
+            print(f"  > Terminal will pause for up to {safe_float(avg_dur)}s (average step duration) for response.")
+            print("! Press Enter (with no input) to skip and finalize using the current state.")
+            print("!" * 80 + "\n")
+            
+            prompt = f"Enter additional iterations to run (or press Enter to skip): "
+            user_input = timed_input(prompt, timeout=avg_dur)
+            
+            if user_input is not None and user_input.strip().isdigit():
+                extend_by = int(user_input.strip())
+                if extend_by > 0:
+                    max_iters_current += extend_by
+                    print(f"\n[RESUME] Extending limit by +{extend_by} steps (New limit: {max_iters_current})...\n")
+                else:
+                    print("\n[RESUME] Invalid amount. Finalizing...")
+            else:
+                print("\n[RESUME] Finalizing calculations using current parameters...")
+
+    # Final calculations using our pure AR(2) model
     lo_extrapolated, _ = extrapolate_infinite_limit(lo_history, min_val=MIN_PHYSICAL_LO)
     n_blocks_extrapolated, _ = extrapolate_infinite_limit(n_history, max_val=total_blocks)
 
-    # Use the stable extrapolation if found; otherwise, fall back safely to the last empirical iteration
+    # Use the stable extrapolation if found; otherwise, fall back safely to the last empirical iteration (using Banker's rounding)
     best_lo = int(round(lo_extrapolated)) if lo_extrapolated is not None else int(round(lo_history[-1]))
-    best_hi = MAX_PHYSICAL_HI
     best_n = int(round(n_blocks_extrapolated)) if n_blocks_extrapolated is not None else int(round(n_history[-1]))
+    best_hi = min(float(MAX_PHYSICAL_HI), max(float(best_lo * 1.5), float(m_classes[2]))) if 'm_classes' in locals() else min(float(MAX_PHYSICAL_HI), max(float(best_lo * 1.5), 1000.0))
 
     print(f"\n  > Global Sequence Extrapolation Successful.")
     print(f"  > Infinite-Limit Fixed Point: LO={best_lo}, HI={best_hi} (Locked), n={best_n}")
@@ -937,12 +1110,23 @@ def run_pipeline():
         except ValueError:
             print(f"Warning: Invalid start_time argument '{sys.argv[4]}'. Defaulting to {safe_float(START_TIME)}.")
 
-    # --- Setup Logging Redirection ---
+    # --- Setup Logging Redirection & Resume Detection ---
     log_file_path = output_file + ".log"
     cache_file_path = output_file + ".cache.json"
 
+    # Parse existing log file if present before stdout/stderr redirection
+    parsed_log = parse_existing_log(log_file_path)
+    
+    log_mode = 'w'
+    if parsed_log:
+        if parsed_log['converged']:
+            print(f"[RESUME] Existing log has converged. Direct loading parameters from history.")
+        else:
+            print(f"[RESUME] Existing log is unconverged with {len(parsed_log['history_lo'])} steps. Continuing sweep.")
+            log_mode = 'a'
+
     try:
-        log_file = open(log_file_path, 'w', encoding='utf-8')
+        log_file = open(log_file_path, log_mode, encoding='utf-8')
     except Exception as e:
         print(f"Warning: Could not initiate log file at {log_file_path}: {e}")
         log_file = None
@@ -955,6 +1139,9 @@ def run_pipeline():
         sys.stdout = Tee(original_stdout, log_file, is_stderr=False)
         sys.stderr = Tee(original_stderr, log_file, is_stderr=True)
 
+    # Track audio state for clean post-run destruction
+    has_audio = False
+
     try:
         # --- Stream Metadata Pre-Scan ---
         # Fetch properties from input container metadata to avoid redundant initial opens.
@@ -966,6 +1153,7 @@ def run_pipeline():
         width = v_stream.width
         height = v_stream.height
         pix_fmt = v_stream.pix_fmt
+        has_audio = len(container.streams.audio) > 0
         container.close()
 
         # --- Dynamic Calibration Cache Verification ---
@@ -1004,15 +1192,22 @@ def run_pipeline():
             Phi = cached_data['Phi']
             H_norm = cached_data['H_norm']
         else:
-            # --- Executing Phase 1 (Audio Stats) ---
-            audio_stats, total_sec = collect_audio_stats(input_file)
+            if has_audio:
+                # --- Executing Phase 1 (Audio Stats) ---
+                audio_stats, total_sec = collect_audio_stats(input_file)
 
-            # --- Executing Phase 2 (Speech-Driven Keep Intervals) ---
-            merged = determine_intervals(audio_stats, total_sec, fps)
+                # --- Executing Phase 2 (Speech-Driven Keep Intervals) ---
+                merged = determine_intervals(audio_stats, total_sec, fps)
+            else:
+                # Calculate total seconds directly from video metadata for audio-less streams
+                container = av.open(input_file)
+                total_sec = float(container.duration / av.time_base) if container.duration else 0.0
+                container.close()
+                merged = [(START_TIME if START_TIME else 0.0, total_sec)]
 
             # --- Executing Phase 3 (Unified Video Profiling & Radiometric Calibration) ---
             best_hi, best_lo, mpdecimate_frac, S_val, Omega, Phi, H_norm, activity_log = profile_video_sweep(
-                input_file, merged, width, height)
+                input_file, merged, width, height, output_file, parsed_log=parsed_log)
 
             # Write calibration metrics immediately to cache before beginning Master Encode
             try:
@@ -1044,7 +1239,9 @@ def run_pipeline():
         auto_lookahead = calculate_temporal_lookahead(merged, fps)
         print(f"  > Temporal Result: Lookahead={auto_lookahead}")
 
-        export_trimmed_audio(input_file, temp_audio_file, merged, total_sec)
+        # Export trimmed audio only if a valid track exists
+        if has_audio:
+            export_trimmed_audio(input_file, temp_audio_file, merged, total_sec)
 
         resolution = f"{width}x{height}"
         input_pix_fmt = pix_fmt.replace('j', '')
@@ -1155,18 +1352,26 @@ def run_pipeline():
         # Configure mpdecimate with our converged, infinite-limit parameters
         v_filter = f"mpdecimate=hi={safe_float(best_hi)}:lo={safe_float(best_lo)}:frac={safe_float(mpdecimate_frac)},setpts=PTS-STARTPTS"
 
+        # Dynamically build FFmpeg input and output parameters depending on stream audio availability
+        audio_inputs = ['-i', temp_audio_file] if has_audio else []
+        audio_outputs = ['-c:a', 'libopus', '-b:a', AUDIO_BITRATE, '-ac', '1', '-vbr', 'on'] if has_audio else ['-an']
+
         ffmpeg_cmd = [
             'ffmpeg', '-hide_banner', '-loglevel', 'warning', '-y', '-fflags', '+genpts',
             '-f', 'rawvideo', '-pix_fmt', input_pix_fmt, '-s', resolution, '-r', safe_float(fps),
-            '-i', 'pipe:0', '-i', temp_audio_file, '-vf', v_filter,
+            '-i', 'pipe:0'
+        ] + audio_inputs + [
+            '-vf', v_filter,
             '-c:v', 'libx265', '-preset', 'veryslow', '-x265-params', ":".join(x265_cfg.values()),
             '-profile:v', 'main', '-pix_fmt', output_pix_fmt, '-color_range', 'pc', '-colorspace', 'bt709',
             '-color_primaries', 'bt709', '-color_trc', 'iec61966-2-1',
-            '-c:a', 'libopus', '-b:a', AUDIO_BITRATE, '-ac', '1', '-vbr', 'on', '-fps_mode', 'vfr',
+        ] + audio_outputs + [
+            '-fps_mode', 'vfr',
             '-movflags', '+faststart', output_file
         ]
 
-        process = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE)
+        # Redirect standard warning/error outputs straight to the log descriptor to keep the terminal clean
+        process = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stderr=log_file if log_file else None)
         buffered_stdin = io.BufferedWriter(process.stdin, buffer_size=io_buffer_size)
 
         start_sec = float(START_TIME) if START_TIME else 0.0
@@ -1189,6 +1394,9 @@ def run_pipeline():
         ref_frame_luma = None
 
         def get_cleanliness_score(luma_arr):
+            # Downsample array 16x (using a 4x spatial stride) for a massive piping speedup
+            luma_arr = luma_arr[::4, ::4]
+            
             # Compute horizontal and vertical gradients
             diff_h = np.abs(luma_arr[1:, :] - luma_arr[:-1, :])
             diff_w = np.abs(luma_arr[:, 1:] - luma_arr[:, :-1])
@@ -1285,6 +1493,14 @@ def run_pipeline():
         if log_file:
             log_file.close()
             print(f"Log written to: {log_file_path}")
+
+        # Clean up temporary WAV track safely from disk
+        if 'temp_audio_file' in locals() and os.path.exists(temp_audio_file):
+            try:
+                os.remove(temp_audio_file)
+                print(f"  > Cleaned up temporary audio track: {temp_audio_file}")
+            except Exception as e:
+                print(f"Warning: Could not remove temporary audio track {temp_audio_file}: {e}")
 
 
 if __name__ == "__main__":
