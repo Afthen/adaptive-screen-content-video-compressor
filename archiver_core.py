@@ -2,30 +2,6 @@
 archiver_core.py
 
 A physical, data-driven screen recording archival pipeline.
-
-================================================================================
-PHYSICAL & CODING-THEORETIC ARCHITECTURE:
-================================================================================
-Every visual and temporal encoding parameter in this pipeline is dynamically
-modeled from the statistical properties of the active audiovisual segments,
-complying strictly with the H.265 specification and x265 parameter limits.
-
-1. Reference Picture Buffer (ref):
-   - Bounded at a maximum of 6 references. In standard HEVC main profile, the DPB
-     is capped at 8 references. Because B-pyramid is enabled by default,
-     specification limits require capping L0 references to 6 to guarantee
-     hardware decoder playback safety.
-
-2. B-Frame Slicetype Decisions (bframe-bias):
-   - Clipped to [-90, 100] to match x265 CLI limits and prevent driver warnings.
-
-3. Loop Filter Deblocking Offsets (deblock):
-   - Fully utilizes the physical loop filter range of [-6, 6] to balance
-     vector text sharpness against noisy gradient smoothing.
-
-4. Spatial AQ Strength (aq-strength):
-   - Mapped across [0.0, 3.0] to bypass high-frequency noise regions while
-     protecting clean backdrops from banding.
 """
 
 import av
@@ -35,10 +11,13 @@ import sys
 import os
 from tqdm import tqdm
 import io
+import json
 import bisect
 import re
 import time
 import ast
+from fractions import Fraction
+from decimal import Decimal
 from concurrent.futures import ProcessPoolExecutor
 
 # ==============================================================================
@@ -46,7 +25,7 @@ from concurrent.futures import ProcessPoolExecutor
 # ==============================================================================
 
 # Time seeking parameters
-START_TIME = 0.0            # Default start time. Can be overridden via command-line arguments.
+START_TIME = 0.0            # Default start time. Can be overridden via command-line or restored from log.
 
 AUDIO_BITRATE = "48k"       # Target bitrate for the compressed mono Opus audio track
 SILENCE_DURATION = 1.0      # Minimum duration (seconds) to classify a segment as silent
@@ -69,8 +48,6 @@ MAX_BLOCK_SUM = MAX_PIXEL_DIFF * BLOCK_SIZE  # 16320
 HIST_SIZE = MAX_BLOCK_SUM + 1  # 16321
 
 # Absolute physical noise floor of an 8-bit digital system.
-# BLOCK_SIZE (64) represents an average absolute change of exactly 1.0 luma step per pixel.
-# Any change below this is mathematically sub-quantization dither noise.
 MIN_PHYSICAL_LO = BLOCK_SIZE
 MAX_PHYSICAL_HI = BLOCK_SIZE * MAX_PIXEL_DIFF
 
@@ -81,19 +58,122 @@ BFRAMES_LIMIT = 16                  # Physical upper limit of consecutive B-fram
 MAX_RC_LOOKAHEAD = 250              # Upper limit for x265 rate control lookahead buffer
 
 # --- Analytical Algorithmic Complexity Crossover ---
-# Derived from first-order complexity theory comparing operational densities:
-# Broadcast (N * T) vs. Suffix-Sum Bincount (N + M).
-# Crossover occurs exactly where N * T = N + M => N = M / (T - 1)
 CROSSOVER_LIMIT = HIST_SIZE // (THRESHOLDS.size - 1)  # Exactly 64 blocks
 
 
 def safe_float(val):
     """
-    Ensures float values are converted to string format using '.' as the decimal
-    separator, bypassing any system locale configurations (e.g., European ',' commas)
-    that would break FFmpeg's command-line parser.
+    Converts float values to their shortest, lossless decimal representation
+    bypassing system locales. Guarantees 17-digit round-trip safety 
+    without exposing binary approximation noise.
     """
-    return format(float(val), 'f')
+    return str(float(val))
+
+
+def high_precision_float(val):
+    """
+    Maintained for API naming consistency. Performs a lossless 
+    double-precision round-trip conversion.
+    """
+    return str(float(val))
+
+
+def to_mixed_fraction_string(num):
+    """
+    Utility helper to convert floats into mixed fractions.
+    """
+    whole = int(num)
+    f_part = Fraction(num - whole).limit_denominator(10000)
+    if f_part == 0:
+        return f"{whole}"
+    elif f_part == 1:
+        return f"{whole + 1}"
+    else:
+        return f"{whole} {f_part.numerator}/{f_part.denominator}"
+
+
+def parse_mixed_fraction(val):
+    """
+    Parses a mixed fraction string (e.g., "11219 83/150" or "89/750") 
+    or a standard numeric value back into a double-precision float.
+    """
+    if isinstance(val, (int, float)):
+        return float(val)
+    val_str = str(val).strip()
+    if ' ' in val_str:
+        whole, frac = val_str.split(' ', 1)
+        num, den = frac.split('/')
+        return float(whole) + float(num) / float(den)
+    elif '/' in val_str:
+        num, den = val_str.split('/')
+        return float(num) / float(den)
+    else:
+        return float(val_str)
+
+
+def format_hhmmss_decimal(sec_val):
+    """
+    Converts seconds to HH:MM:SS.SS... format without truncating non-zero decimals,
+    using decimal.Decimal for precision to avoid binary floating-point noise.
+    """
+    d = Decimal(str(sec_val))
+    hours = int(d // 3600)
+    minutes = int((d % 3600) // 60)
+    seconds = d % 60
+    
+    sec_str = str(seconds.normalize())
+    if '.' in sec_str:
+        parts = sec_str.split('.')
+        sec_formatted = f"{parts[0].zfill(2)}.{parts[1]}"
+    else:
+        sec_formatted = sec_str.zfill(2)
+        
+    return f"{hours:02d}:{minutes:02d}:{sec_formatted}"
+
+
+def seconds_to_time_string(sec_val):
+    """
+    Converts a raw float duration into a clean, readable time representation
+    (e.g., 1032.0 -> '17:12', 3661.0 -> '01:01:01').
+    """
+    sec_val = float(sec_val)
+    hours = int(sec_val // 3600)
+    minutes = int((sec_val % 3600) // 60)
+    seconds = sec_val % 60
+    
+    sec_str = format(seconds, '.15g')
+    if '.' in sec_str:
+        parts = sec_str.split('.')
+        sec_formatted = f"{parts[0].zfill(2)}.{parts[1]}"
+    else:
+        sec_formatted = sec_str.zfill(2)
+        
+    if hours > 0:
+        return f"{hours:02d}:{minutes:02d}:{sec_formatted}"
+    else:
+        return f"{minutes:02d}:{sec_formatted}"
+
+
+def parse_time_string_to_seconds(time_str):
+    """
+    Parses an interactive input time string (e.g., '21:25', '01:10:05', or raw seconds)
+    back into a double-precision float.
+    """
+    time_str = str(time_str).strip()
+    if not time_str:
+        return 0.0
+    if ':' in time_str:
+        parts = time_str.split(':')
+        if len(parts) == 3:
+            h, m, s = parts
+            return float(h) * 3600 + float(m) * 60 + float(s)
+        elif len(parts) == 2:
+            m, s = parts
+            return float(m) * 60 + float(s)
+        else:
+            raise ValueError(f"Invalid time format: {time_str}")
+    else:
+        return float(time_str)
 
 
 def extract_luma_from_ndarray(arr, height, width):
@@ -102,53 +182,15 @@ def extract_luma_from_ndarray(arr, height, width):
     directly from the decoded frame array to avoid redundant memory copies.
     """
     if arr.ndim == 2:
-        # Planar YUV format (e.g., yuv420p, yuv422p).
-        # The Y plane occupies the top 'height' rows.
         return arr[:height, :].astype(np.int16)
     elif arr.ndim == 3:
         if arr.shape[0] == 3:
-            # Planar format with channel-first ordering (e.g., yuv444p, gbrp).
-            # The first channel represents Y or G.
             return arr[0, :, :].astype(np.int16)
         elif arr.shape[2] == 3:
-            # Interleaved packed format (e.g., rgb24, bgr24).
-            # Apply standard ITU-R BT.601 luma coefficients.
             return (0.299 * arr[:, :, 0] + 0.587 * arr[:, :, 1] + 0.114 * arr[:, :, 2]).astype(np.int16)
         elif arr.shape[2] == 1:
-            # Grayscale format
             return arr[:, :, 0].astype(np.int16)
-    # Default fallback slice
     return arr[:height, :width].astype(np.int16)
-
-
-# ==============================================================================
-# --- OUTPUT MULTIPLEXING (LOGGING) --------
-# ==============================================================================
-
-class Tee:
-    """
-    Duplicates output writes to both the standard console stream and a log file.
-    Filters raw progression streams to avoid writing incremental tqdm bar changes to the file.
-    """
-    def __init__(self, original_stream, file_stream, is_stderr=False):
-        self.original_stream = original_stream
-        self.file_stream = file_stream
-        self.is_stderr = is_stderr
-
-    def write(self, data):
-        self.original_stream.write(data)
-        if self.file_stream:
-            if self.is_stderr and '\r' in data and '\n' not in data:
-                return
-            self.file_stream.write(data)
-
-    def flush(self):
-        self.original_stream.flush()
-        if self.file_stream:
-            self.file_stream.flush()
-
-    def __getattr__(self, attr):
-        return getattr(self.original_stream, attr)
 
 
 # ==============================================================================
@@ -158,7 +200,6 @@ class Tee:
 def timed_input(prompt, timeout):
     """
     Cross-platform non-blocking timed input.
-    Returns the user's string input if entered, or None if the timeout expires.
     """
     print(prompt, end='', flush=True)
     
@@ -168,14 +209,13 @@ def timed_input(prompt, timeout):
         input_chars = []
         while time.time() - start_time < timeout:
             if msvcrt.kbhit():
-                char = msvcrt.getwche()  # Read character with console echo
-                if char in ('\r', '\n'):  # Enter key pressed
-                    print()  # Advance to next line
+                char = msvcrt.getwche()
+                if char in ('\r', '\n'):
+                    print()
                     return ''.join(input_chars)
-                elif char == '\b':  # Backspace
+                elif char == '\b':
                     if input_chars:
                         input_chars.pop()
-                        # Erase character visually from console
                         print(' \b', end='', flush=True)
                 else:
                     input_chars.append(char)
@@ -184,7 +224,6 @@ def timed_input(prompt, timeout):
         return None
     else:
         import select
-        # Unix-like select stream listener
         rlist, _, _ = select.select([sys.stdin], [], [], timeout)
         if rlist:
             return sys.stdin.readline().strip()
@@ -193,56 +232,69 @@ def timed_input(prompt, timeout):
             return None
 
 
+def write_state_to_log(output_file, payload):
+    """
+    Appends a machine-readable structured JSON state line directly into the log file.
+    No console outputs ever touch this file, keeping it 100% clean of terminal logs.
+    """
+    log_file_path = output_file + ".log"
+    try:
+        with open(log_file_path, 'a', encoding='utf-8') as f:
+            f.write(f"#STATE: {json.dumps(payload)}\n")
+    except Exception:
+        pass
+
+
 def parse_existing_log(log_file_path):
     """
     Parses an existing log file to extract high-precision history and check convergence.
+    Safely converts keep intervals (even if saved as mixed fractions) back into floats.
     """
     if not os.path.exists(log_file_path):
         return None
         
     try:
-        with open(log_file_path, 'r', encoding='utf-8') as f:
-            content = f.read()
-            
-        # Parse all past iteration parameters: LO, n
-        iterations = re.findall(r"-\s*Iteration\s*(\d+):.*?Parameters:\s*LO=([0-9.]+).*?n=([0-9.]+)", content, re.DOTALL)
-        
-        # Parse all past raw float projections
-        projections = re.findall(r"Current Projection L\(n\):\s*LO=([0-9.]+).*?n=([0-9.]+)", content)
-        
-        # Parse State lines: Sep, H_norm, Omega, Phi
-        state_matches = re.findall(r"State:\s*Sep=([0-9.]+),\s*H_norm=([0-9.]+),\s*Omega=([0-9.]+),\s*Phi=([0-9.]+)", content)
-        
-        # Parse Keep Intervals list and Total Duration
-        match_intervals = re.search(r"> Keep Intervals: (\[.*?\])", content)
-        match_duration = re.search(r"> Total Duration: ([0-9.]+) seconds", content)
-        
+        history_lo = []
+        history_n = []
+        projections = []
+        state_matches = []
         merged_list = None
         total_sec_val = None
+        start_time_val = 0.0
         
-        if match_intervals and match_duration:
-            try:
-                merged_list = ast.literal_eval(match_intervals.group(1))
-                total_sec_val = float(match_duration.group(1))
-            except Exception:
-                pass
-
-        if iterations:
-            history_lo = [float(item[1]) for item in iterations]
-            history_n = [float(item[2]) for item in iterations]
-            
+        with open(log_file_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                if line.strip().startswith("#STATE:"):
+                    json_str = line.strip().split("#STATE:", 1)[1].strip()
+                    try:
+                        data = json.loads(json_str)
+                        if data['event'] == 'intervals':
+                            raw_merged = data['merged']
+                            merged_list = []
+                            for start_val, end_val in raw_merged:
+                                merged_list.append((parse_mixed_fraction(start_val), parse_mixed_fraction(end_val)))
+                            total_sec_val = data['total_sec']
+                            start_time_val = data.get('start_time', 0.0)
+                        elif data['event'] == 'iteration':
+                            history_lo.append(data['lo'])
+                            history_n.append(data['n'])
+                            state_matches.append(data['state'])
+                        elif data['event'] == 'projection':
+                            projections.append((data['lo_est'], data['n_est']))
+                    except Exception:
+                        pass
+                        
+        if history_lo:
             converged = False
             final_lo, final_n = None, None
             final_state = None
             
-            # Check for convergence using Banker's rounded values of raw float projections
             if len(projections) >= 2:
-                last_lo = float(projections[-1][0])
-                last_n = float(projections[-1][1])
-                second_last_lo = float(projections[-2][0])
-                second_last_n = float(projections[-2][1])
+                last_lo = projections[-1][0]
+                last_n = projections[-1][1]
+                second_last_lo = projections[-2][0]
+                second_last_n = projections[-2][1]
                 
-                # Apply Python's native Banker's rounding (round-to-even)
                 last_lo_rounded = int(round(last_lo))
                 last_n_rounded = int(round(last_n))
                 second_last_lo_rounded = int(round(second_last_lo))
@@ -253,7 +305,7 @@ def parse_existing_log(log_file_path):
                     final_lo = last_lo_rounded
                     final_n = last_n_rounded
                     if state_matches:
-                        final_state = [float(x) for x in state_matches[-1]]
+                        final_state = state_matches[-1]
                         
             return {
                 'history_lo': history_lo,
@@ -263,7 +315,8 @@ def parse_existing_log(log_file_path):
                 'final_n': final_n,
                 'final_state': final_state,
                 'merged': merged_list,
-                'total_sec': total_sec_val
+                'total_sec': total_sec_val,
+                'start_time': start_time_val
             }
     except Exception as e:
         print(f"[RESUME] Warning: Failed to parse existing log file ({e}). Starting fresh.")
@@ -278,9 +331,6 @@ def parse_existing_log(log_file_path):
 def perform_otsu_sweep(data, weights=None):
     """
     Class 3 Otsu Thresholding Sweep.
-
-    Splits a 1D probability distribution into three distinct, mathematically
-    optimal classes by maximizing the between-class variance (minimizing intra-class variance).
     """
     if data.size == 0:
         return 0.0, 0.0, 0.0, (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)
@@ -289,7 +339,6 @@ def perform_otsu_sweep(data, weights=None):
     if np.isclose(d_min, d_max, atol=EPSILON):
         return float(d_min), float(d_max), 0.0, (float(d_min), float(d_min), float(d_min)), (1.0, 0.0, 0.0)
 
-    # Bin the data deterministically into 256 intervals
     hist, bin_edges = np.histogram(data, bins=256, range=(d_min, d_max), weights=weights)
     bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
 
@@ -297,43 +346,36 @@ def perform_otsu_sweep(data, weights=None):
     if total_samples < EPSILON:
         return float(d_min), float(d_max), 0.0, (float(d_min), float(d_min), float(d_min)), (1.0, 0.0, 0.0)
 
-    # Normalize histogram to get the probability density function (PDF)
     prob = hist.astype(np.float64) / total_samples
 
-    # Compute cumulative probability (omega) and cumulative first-moment (mu)
     omega = np.cumsum(prob)
     mu = np.cumsum(prob * bin_centers)
     mu_total = mu[-1]
 
-    # Calculate total variance of the entire dataset
     total_var = np.sum(prob * (bin_centers - mu_total) ** 2)
 
     max_var_b = -1.0
     best_t1, best_t2 = 0, 0
 
-    # Exhaustive search over all possible dual-threshold pairs (t1, t2)
     for t1 in range(len(prob) - 2):
         w0 = omega[t1]
         if w0 < EPSILON: continue
-        m0 = mu[t1] / w0  # Mean of Class 0
+        m0 = mu[t1] / w0
 
         for t2 in range(t1 + 1, len(prob) - 1):
-            w1 = omega[t2] - w0      # Weight of Class 1
-            w2 = 1.0 - omega[t2]     # Weight of Class 2
+            w1 = omega[t2] - w0
+            w2 = 1.0 - omega[t2]
 
             if w1 < EPSILON or w2 < EPSILON: continue
 
-            m1 = (mu[t2] - mu[t1]) / w1       # Mean of Class 1
-            m2 = (mu_total - mu[t2]) / w2     # Mean of Class 2
+            m1 = (mu[t2] - mu[t1]) / w1
+            m2 = (mu_total - mu[t2]) / w2
 
-            # Calculate between-class variance
             var_b = (w0 * (m0 ** 2) + w1 * (m1 ** 2) + w2 * (m2 ** 2)) - (mu_total ** 2)
 
-            # Maximize between-class variance
             if var_b > max_var_b:
                 max_var_b, best_t1, best_t2 = var_b, t1, t2
 
-    # Separability represents the proportion of variance explained by the 3-class model
     separability = max_var_b / total_var if total_var > EPSILON else 0.0
 
     w0_f = omega[best_t1]
@@ -357,8 +399,7 @@ def perform_otsu_sweep(data, weights=None):
 
 def collect_audio_stats(input_file):
     """
-    Decodes and profiles the audio stream to extract root-mean-square (RMS) energy,
-    zero-crossing rate (ZCR), and spectral energy ratios in the human speech band.
+    Decodes and profiles the audio stream to extract speech metrics.
     """
     container = av.open(input_file)
     a_stream = container.streams.audio[0]
@@ -383,7 +424,6 @@ def collect_audio_stats(input_file):
 
             samples = raw.astype(np.float64).mean(axis=0).flatten() if raw.ndim > 1 else raw.flatten().astype(np.float64)
 
-            # Normalize integer PCM samples to float [-1.0, 1.0] using np.float64 bounds
             if np.issubdtype(raw.dtype, np.integer):
                 samples /= np.float64(np.iinfo(raw.dtype).max)
 
@@ -391,16 +431,13 @@ def collect_audio_stats(input_file):
                 pbar.update(frame.samples / sr)
                 continue
 
-            # Time-domain metrics
             rms = np.sqrt(np.mean(samples ** 2))
             zcr = np.mean(np.abs(np.diff(np.sign(samples)))) / 2
 
-            # Frequency-domain metrics (Real FFT)
             fft_data = np.abs(np.fft.rfft(samples))
             freqs = np.fft.rfftfreq(len(samples), 1 / sr)
             total_e = np.sum(fft_data)
 
-            # Calculate the proportion of spectral energy residing in the human speech band
             fft_ratio = np.sum(fft_data[(freqs >= SPEECH_BAND_MIN) & (freqs <= SPEECH_BAND_MAX)]) / total_e if total_e > 0 else 0
 
             audio_stats.append({'ts': ts, 'rms': rms, 'zcr': zcr, 'fft': fft_ratio})
@@ -424,7 +461,6 @@ def determine_intervals(audio_stats, dur, fps):
     zcr_vals = np.array([f['zcr'] for f in audio_stats])
     fft_vals = np.array([f['fft'] for f in audio_stats])
 
-    # 1. Determine voice activity thresholds using Otsu sweeps
     non_zero_rms = rms_vals[rms_vals > 0]
     if len(non_zero_rms) == 0:
         auto_rms_thresh = 0.0
@@ -432,13 +468,13 @@ def determine_intervals(audio_stats, dur, fps):
         min_audio_magnitude = np.min(non_zero_rms)
         safe_rms = np.clip(rms_vals, a_min=min_audio_magnitude, a_max=None)
         t1_rms, t2_rms, _, _, _ = perform_otsu_sweep(np.log10(safe_rms))
-        auto_rms_thresh = 10 ** t2_rms  # Map back from logarithmic scale
+        auto_rms_thresh = 10 ** t2_rms
 
     t1_zcr, t2_zcr, _, _, _ = perform_otsu_sweep(zcr_vals)
-    auto_zcr_thresh = t1_zcr  # ZCR is lower for speech (vowels) than fricative noise
+    auto_zcr_thresh = t1_zcr
 
     t1_fft, t2_fft, _, _, _ = perform_otsu_sweep(fft_vals)
-    auto_fft_thresh = t2_fft  # FFT energy ratio is high inside the speech band
+    auto_fft_thresh = t2_fft
 
     print(f"  > Audio Thresholds: RMS={auto_rms_thresh}, ZCR={auto_zcr_thresh}, FFT={auto_fft_thresh}")
 
@@ -446,13 +482,11 @@ def determine_intervals(audio_stats, dur, fps):
     frame_dur = 1.0 / fps
     keep_intervals, current_start = [], None
 
-    # 2. Audio Pass: Isolate all active voice segments
     for f in audio_stats:
         is_speech = (f['rms'] > auto_rms_thresh) and (f['zcr'] < auto_zcr_thresh) and (f['fft'] > auto_fft_thresh)
         if is_speech:
             if current_start is None: current_start = f['ts']
         elif current_start is not None:
-            # Apply MARGIN_SECS padding to prevent conversational clipping
             keep_intervals.append((max(start_sec, current_start - MARGIN_SECS),
                                    min(dur, f['ts'] + MARGIN_SECS)))
             current_start = None
@@ -462,7 +496,6 @@ def determine_intervals(audio_stats, dur, fps):
     if not keep_intervals:
         return [(start_sec, start_sec + frame_dur)]
 
-    # 3. Merge Pass: Sort and merge overlapping or adjacent intervals
     keep_intervals.sort()
     merged = [keep_intervals[0]]
     for next_s, next_e in keep_intervals[1:]:
@@ -471,7 +504,6 @@ def determine_intervals(audio_stats, dur, fps):
         else:
             merged.append((next_s, next_e))
 
-    # Log keep intervals to the log file so they can be parsed for resumption
     print(f"  > Keep Intervals: {merged}")
     return merged
 
@@ -480,13 +512,9 @@ def determine_intervals(audio_stats, dur, fps):
 # --- PHASE 3: VIDEO PROFILING ENGINE ------
 # ==============================================================================
 
-
 def worker_analyze_sweep(args):
     """
     Parallel Worker Process.
-
-    Decodes a temporal segment (chunk) of the video and simulates the block-level
-    decimation behavior of FFmpeg's 'mpdecimate' filter using active feedback thresholds.
     """
     input_file, segments, filter_hi, filter_lo, filter_n = args
     frame_stats = []
@@ -495,18 +523,16 @@ def worker_analyze_sweep(args):
     local_total_blocks = 0
     local_frames_processed = 0
 
-    # Deterministic magnitude histogram containing counts of all block sums
     local_mag_hist = np.zeros(HIST_SIZE, dtype=np.int64)
 
     try:
         container = av.open(input_file)
         v_stream = container.streams.video[0]
 
-        v_stream.codec_context.thread_count = 0  # 0 enables auto-detection of CPU cores
-        v_stream.codec_context.thread_type = "AUTO"  # Let FFmpeg choose optimal multithreading
+        v_stream.codec_context.thread_count = 0
+        v_stream.codec_context.thread_type = "AUTO"
 
         for start_time, end_time in segments:
-            # Seek to the keyframe nearest to the start_time of this specific sub-segment
             container.seek(int(start_time / float(v_stream.time_base)), stream=v_stream)
             ref_frame = None
 
@@ -514,22 +540,20 @@ def worker_analyze_sweep(args):
                 ts = float(frame.pts * v_stream.time_base) if frame.pts is not None else 0.0
                 if ts < start_time:
                     continue
-                if ts > end_time: break  # Cease decoding when exceeding chunk boundary
+                if ts > end_time: break
                 local_frames_processed += 1
 
-                # Access the raw Y (Luma) plane safely depending on format
                 plane = frame.planes[0]
-                if len(frame.planes) > 1: # Standard planar YUV (yuv420p, yuv422p, yuv444p)
+                if len(frame.planes) > 1:
                     arr = np.frombuffer(plane, np.uint8).reshape(plane.height, plane.line_size)
                     curr_frame = arr[:, :plane.width].astype(np.int16)
-                else: # Packed format (RGB, BGR, Grayscale, etc.)
+                else:
                     curr_frame = extract_luma_from_ndarray(frame.to_ndarray(), plane.height, plane.width)
 
                 if ref_frame is None:
                     ref_frame = curr_frame
                     continue
 
-                # --- SPEED OPTIMIZATION: Fast-Fail ---
                 diff = np.abs(curr_frame - ref_frame)
                 if np.max(diff) == 0:
                     continue
@@ -538,9 +562,7 @@ def worker_analyze_sweep(args):
                 num_blocks = (h // 8) * (w // 8)
                 local_total_blocks += num_blocks
 
-                # Subdivide the frame difference matrix into 8x8 block matrices
                 blocks = diff[:(h // 8) * 8, :(w // 8) * 8].reshape(h // 8, 8, w // 8, 8)
-                # Sum the absolute differences inside each 8x8 block
                 block_sums = blocks.sum(axis=(1, 3)).flatten()
                 active_sums = block_sums[block_sums > 0]
 
@@ -548,8 +570,6 @@ def worker_analyze_sweep(args):
                     local_active_blocks += active_sums.size
                     activity_log.append((ts, np.max(active_sums)))
 
-                    # OPTIMIZATION: Analytically Derived Hybrid Threshold Counter
-                    # Bypasses arbitrary thresholds by utilizing the complexity-theory crossover limit (64 blocks).
                     if active_sums.size < CROSSOVER_LIMIT:
                         counts = np.sum(active_sums[:, None] > THRESHOLDS, axis=0)
                     else:
@@ -559,17 +579,12 @@ def worker_analyze_sweep(args):
                         counts = suffix_sum_padded[THRESHOLDS + 1]
 
                     frame_stats.append(counts.astype(np.int32))
-
-                    # Deterministically increment the global luma-magnitude histogram
                     np.add.at(local_mag_hist, active_sums, 1)
 
-                    # Emulate mpdecimate's dual-gate frame keeping logic
-                    # Opt: dead condition check removed. Iteration 1 starts naturally with lo=0, n=0
                     num_hi = np.sum(block_sums > filter_hi)
                     num_lo = np.sum(block_sums > filter_lo)
                     is_kept = (num_hi > 0) or (num_lo > filter_n)
 
-                    # If the frame is kept by mpdecimate, we update the reference frame
                     if is_kept:
                         ref_frame = curr_frame
 
@@ -585,12 +600,10 @@ def calculate_radiometric_constants_raw(counts_data, mag_hist, g_active, g_total
     """
     Performs Otsu sweeps over the collected data arrays to find the optimal
     noise-separation thresholds, keeping them as high-precision floats.
-    Now calculates the normalized Shannon Entropy of active changes.
-
-    Note: Removed unused `g_frames` argument from function signature.
+    Calculates the normalized Shannon Entropy of active changes.
     """
     if counts_data.shape[0] == 0 or g_total == 0:
-        return float(MAX_BLOCK_SUM), 100.0, 1.0, 0.0, 0.0, 0.0, 0.0
+        return float(MAX_PHYSICAL_HI), 100.0, 1.0, 0.0, 0.0, 0.0, 0.0
 
     # Calculate Shannon Entropy strictly on active differences (ignoring index 0)
     active_mag_hist = mag_hist[1:]
@@ -613,8 +626,8 @@ def calculate_radiometric_constants_raw(counts_data, mag_hist, g_active, g_total
     # Map LO to the higher Otsu threshold (t2)
     best_lo = max(float(MIN_PHYSICAL_LO), float(t2))
 
-    # Map best_hi to a mathematically derived contrast boundary instead of locking it to MAX_PHYSICAL_HI
-    best_hi = min(float(MAX_PHYSICAL_HI), max(float(best_lo * 1.5), float(m_classes[2])))
+    # HI is strictly locked to the absolute physical maximum of an 8x8 block (16320.0)
+    best_hi = float(MAX_PHYSICAL_HI)
 
     # Calculate spatial-temporal entropy metrics
     p_nonzero = g_active / g_total
@@ -631,7 +644,6 @@ def calculate_radiometric_constants_raw(counts_data, mag_hist, g_active, g_total
     if active_frame_counts.size < 10:
         n_blocks = 1.0
     else:
-        # Keep block count threshold as a float
         n_blocks = float(perform_otsu_sweep(active_frame_counts)[0])
 
     return best_hi, best_lo, n_blocks, separability, omega_metric, phi_metric, norm_entropy
@@ -652,20 +664,16 @@ def profile_video_sweep(input_file, keep_intervals, width, height, output_file, 
     try:
         with av.open(input_file) as kf_container:
             v_stream_kf = kf_container.streams.video[0]
-            # Demux only yields packet headers, bypassing video decoding completely
             for packet in kf_container.demux(v_stream_kf):
                 if packet.pts is None:
                     continue
                 if packet.is_keyframe:
-                    # Map PTS to seconds using the stream's time base
                     kf_times.append(float(packet.pts * v_stream_kf.time_base))
     except Exception as e:
         print(f"  > Warning: Rapid keyframe pre-scan failed ({e}). Falling back to empty GOP map.")
         kf_times = []
 
-    # Ensure times are sorted for correct binary search partitioning
     kf_times.sort()
-
     total_blocks = (width // 8) * (height // 8)
 
     # ==========================================================================
@@ -673,83 +681,59 @@ def profile_video_sweep(input_file, keep_intervals, width, height, output_file, 
     # ==========================================================================
     if parsed_log and parsed_log['converged']:
         best_lo = parsed_log['final_lo']
-        best_hi = min(float(MAX_PHYSICAL_HI), max(float(best_lo * 1.5), 1000.0))  # Dynamic boundary fallback
+        best_hi = float(MAX_PHYSICAL_HI)  # Strictly locked to physical maximum
         best_n = parsed_log['final_n']
-        
-        # Restore saved state from log file
+
         if parsed_log['final_state']:
             separability, norm_entropy, omega_metric, phi_metric = parsed_log['final_state']
         else:
             separability, norm_entropy, omega_metric, phi_metric = 0.85, 0.68, 0.003, 0.97
-            
+
         mpdecimate_frac = np.clip(best_n / total_blocks, EPSILON, 1.0)
-        
+
         print(f"\n[RESUME] Native Convergence Found in Log. Direct Loading Parameters:")
         print(f"  > Parameters: LO={best_lo}, HI={best_hi}, n={best_n} (FRAC={safe_float(mpdecimate_frac)})")
         return best_hi, best_lo, mpdecimate_frac, separability, omega_metric, phi_metric, norm_entropy, []
 
     def extrapolate_infinite_limit(seq, min_val=0, max_val=MAX_BLOCK_SUM):
-        """
-        Extrapolates parameter patterns into their infinite-limit values using
-        second-order auto-regression (AR(2)) with drift. Stability is verified
-        via the roots of the characteristic polynomial.
-
-        Returns:
-            (limit, steps) if a stable, convergent AR(2) fit is found.
-            (None, None) if history is too short, fit is low-rank, or the sequence
-                         is locally unstable (e.g., accelerating).
-        """
-        # AR(2) with intercept needs n-2 samples >= 3 unknowns (A1, A2, c)
         if len(seq) < 5:
-            return None, None
+            return None, None, None, None
 
         y = np.array(seq, dtype=np.float64)
-
-        # Two-lag design matrix with intercept column: [y[n-1], y[n-2], 1] -> y[n]
         X = np.column_stack([y[1:-1], y[:-2], np.ones(len(y) - 2)])
         Y = y[2:]
 
-        # OLS via least-squares
         coeffs, _, rank, _ = np.linalg.lstsq(X, Y, rcond=None)
         if rank < 3:
-            return None, None
+            return None, None, None, None
 
         A1, A2, c = coeffs
 
-        # Stability check: both roots of z^2 - A1*z - A2 = 0 must lie inside the unit circle
-        roots = np.roots([1, -A1, -A2])
-        if not np.all(np.abs(roots) < 1.0):
-            return None, None
+        # Schur-Cohn Stability Check
+        is_stable = (A2 > -1.0) and (A1 + A2 < 1.0) and (A2 - A1 < 1.0)
+        if not is_stable:
+            return None, None, A1, A2
 
-        # AR(2) fixed point: y* = c / (1 - A1 - A2)
         denom = 1.0 - A1 - A2
         if abs(denom) < 1e-8:
-            return None, None
+            return None, None, A1, A2
 
         limit = c / denom
         if not (min_val <= limit <= max_val):
-            return None, None
+            return None, None, A1, A2
 
-        current_val = seq[-1]
-        distance = abs(current_val - limit)
-
-        # Step estimate uses spectral radius (dominant root magnitude) as the convergence rate
-        spectral_radius = np.max(np.abs(roots))
+        roots = np.roots([1, -A1, -A2])
+        spectral_radius = np.max(np.abs(roots)) if 'roots' in locals() else np.sqrt(max(0.0, -A2))
         if distance > 0.5 and spectral_radius > EPSILON:
             steps = int(np.ceil(np.log(0.5 / distance) / np.log(spectral_radius)))
         else:
             steps = 0
 
-        return limit, steps
+        return limit, steps, A1, A2
 
-    # 1. HARDWARE CONCURRENCY ASSESSMENT
-    # Sub-linear worker scaling minimizes scheduler context-switch overhead
     logical_cores = os.cpu_count() or 1
     num_workers = max(1, int(np.round(np.sqrt(logical_cores))))
 
-    # 2. INTERSECT TIMELINE (Speech-Interval Snapped GOPs)
-    # Partitions keep-intervals using the physical keyframes that fall inside them.
-    # This guarantees zero speech data loss while maintaining clean decodes.
     active_gop_segments = []
     for s, e in keep_intervals:
         idx_start = bisect.bisect_right(kf_times, s)
@@ -763,27 +747,18 @@ def profile_video_sweep(input_file, keep_intervals, width, height, output_file, 
     active_gop_durs = np.array([e - s for s, e in active_gop_segments])
     total_keep_dur = sum(active_gop_durs)
 
-    # 3. DYNAMIC BOUNDS CALCULATION
-    # - T_min: Prevents IPC/Process scheduling overhead from dominating runtimes (max 16 tasks per worker)
-    # - T_max: Ensures balanced workload distribution (min 2 tasks per worker)
     T_min = total_keep_dur / (16.0 * num_workers)
     T_max = total_keep_dur / (2.0 * num_workers)
 
-    # 4. LOGARITHMIC GOP OTSU SWEEP
     if active_gop_durs.size >= 10:
         log_gops = np.log10(np.clip(active_gop_durs, a_min=0.1, a_max=None))
         _, t2_log, _, _, _ = perform_otsu_sweep(log_gops)
         T_static = 10 ** t2_log
     else:
-        # Mathematical fallback to the geometric mean of the hardware bounds
         T_static = np.sqrt(T_min * T_max)
 
-    # Clamp the static threshold strictly within the hardware bounds
     T_static = np.clip(T_static, T_min, T_max)
 
-    # 5. DYNAMIC CHUNKING (Stillness vs. Motion Classification)
-    # - Static intervals (>= T_static) are emitted as isolated chunks to maximize skip probability.
-    # - Active intervals (< T_static) are accumulated together into single chunks to reduce IPC overhead.
     groups = []
     current_group = []
     accumulated_dur = 0.0
@@ -812,8 +787,8 @@ def profile_video_sweep(input_file, keep_intervals, width, height, output_file, 
     tasks = [(input_file, g) for g in groups]
     avg_chunk_dur = total_keep_dur / len(groups) if groups else 0.0
     print(
-        f"  > Divided keep intervals ({safe_float(total_keep_dur)}s active) into {len(groups)} hardware-scaled segments "
-        f"({num_workers} workers, avg chunk: {safe_float(avg_chunk_dur)}s)...")
+        f"  > Divided keep intervals ({high_precision_float(total_keep_dur)}s active) into {len(groups)} hardware-scaled segments "
+        f"({num_workers} workers, avg chunk: {high_precision_float(avg_chunk_dur)}s)...")
 
     # ==========================================================================
     # --- RESUME POINT CHECK: HISTORY INJECTION ---
@@ -827,21 +802,18 @@ def profile_video_sweep(input_file, keep_intervals, width, height, output_file, 
         lo_history = list(parsed_log['history_lo'])
         n_history = list(parsed_log['history_n'])
         start_iter_idx = len(lo_history)
-        
-        # Seed parameters with the last unconverged values from the log file
         lo = lo_history[-1]
         n_blocks = n_history[-1]
         print(f"  > Pre-loaded {start_iter_idx} steps of historical AR(2) metrics from log.")
 
     prev_extrapolated_lo = None
     prev_extrapolated_n = None
-    hi = float(MAX_PHYSICAL_HI)
-    max_iters_current = 24  # Base maximum iterations
+    hi = float(MAX_PHYSICAL_HI)  # Locked to physical maximum for workers
+    max_iters_current = 24
     relaxation_damping = 2.0 / 3.0
     static_chunks = set()
     iter_durations = []
 
-    # Guard metric fallback definitions to protect against empty iteration sets
     last_iter_metrics = {
         'separability': 0.0,
         'omega_metric': 0.0,
@@ -853,6 +825,10 @@ def profile_video_sweep(input_file, keep_intervals, width, height, output_file, 
         'g_frm': 0
     }
 
+    # Initialized before loop to act as persistent state flag
+    converged_early = False
+    prev_energy_lo = None
+
     iter_idx = start_iter_idx
     while iter_idx < max_iters_current:
         iter_start = time.time()
@@ -860,13 +836,11 @@ def profile_video_sweep(input_file, keep_intervals, width, height, output_file, 
         task_mapping = []
 
         for i, t in enumerate(tasks):
-            if i in static_chunks:
-                continue
+            if i in static_chunks: continue
             active_tasks.append((t[0], t[1], hi, lo, n_blocks))
             task_mapping.append(i)
 
-        if not active_tasks:
-            break
+        if not active_tasks: break
 
         f_stats = []
         global_mag_hist = np.zeros(HIST_SIZE, dtype=np.int64)
@@ -893,7 +867,6 @@ def profile_video_sweep(input_file, keep_intervals, width, height, output_file, 
 
         counts_data = np.vstack(f_stats) if f_stats else np.empty((0, len(THRESHOLDS)))
 
-        # Retrieve new metrics including normalized entropy
         hi_new, lo_new, n_new, separability, omega_metric, phi_metric, norm_entropy_new = calculate_radiometric_constants_raw(
             counts_data, global_mag_hist, g_act, g_tot
         )
@@ -909,7 +882,6 @@ def profile_video_sweep(input_file, keep_intervals, width, height, output_file, 
             'g_frm': g_frm
         }
 
-        # Apply relaxation damping and calculate deltas
         if iter_idx == 0:
             lo, n_blocks = lo_new, n_new
             lo_diff_abs, lo_diff_rel = 0.0, 0.0
@@ -928,36 +900,62 @@ def profile_video_sweep(input_file, keep_intervals, width, height, output_file, 
         lo_history.append(lo)
         n_history.append(n_blocks)
 
-        # Generate structural log representation with absolute and relative delta shifts
-        delta_str_lo = f" (Δ abs: {safe_float(lo_diff_abs)}, rel: {safe_float(lo_diff_rel)}%)" if iter_idx > 0 else " (Initial)"
-        delta_str_n = f" (Δ abs: {safe_float(n_diff_abs)}, rel: {safe_float(n_diff_rel)}%)" if iter_idx > 0 else " (Initial)"
+        write_state_to_log(output_file, {
+            "event": "iteration",
+            "iter": iter_idx + 1,
+            "lo": float(lo),
+            "n": float(n_blocks),
+            "state": [float(separability), float(norm_entropy_new), float(omega_metric), float(phi_metric)]
+        })
+
+        delta_str_lo = f" (Δ abs: {high_precision_float(lo_diff_abs)}, rel: {high_precision_float(lo_diff_rel)}%)" if iter_idx > 0 else " (Initial)"
+        delta_str_n = f" (Δ abs: {high_precision_float(n_diff_abs)}, rel: {high_precision_float(n_diff_rel)}%)" if iter_idx > 0 else " (Initial)"
 
         print(
             f"    - Iteration {iter_idx + 1}:\n"
-            f"      > Parameters: LO={safe_float(lo)}{delta_str_lo}\n"
-            f"                    HI={safe_float(hi)} (Locked)\n"
-            f"                    n={safe_float(n_blocks)}{delta_str_n}\n"
-            f"      > State:      Sep={safe_float(separability)}, H_norm={safe_float(norm_entropy_new)}, "
-            f"Omega={safe_float(omega_metric)}, Phi={safe_float(phi_metric)}"
+            f"      > Parameters: LO={high_precision_float(lo)}{delta_str_lo}\n"
+            f"                    HI={high_precision_float(hi)} (Locked)\n"
+            f"                    n={high_precision_float(n_blocks)}{delta_str_n}\n"
+            f"      > State:      Sep={high_precision_float(separability)}, H_norm={high_precision_float(norm_entropy_new)}, "
+            f"Omega={high_precision_float(omega_metric)}, Phi={high_precision_float(phi_metric)}"
         )
 
-        converged_early = False
         if len(lo_history) >= 5:
-            lo_est, lo_steps = extrapolate_infinite_limit(lo_history, min_val=MIN_PHYSICAL_LO)
-            n_est, n_steps = extrapolate_infinite_limit(n_history, max_val=total_blocks)
+            lo_est, lo_steps, lo_A1, lo_A2 = extrapolate_infinite_limit(lo_history, min_val=MIN_PHYSICAL_LO)
+            n_est, n_steps, n_A1, n_A2 = extrapolate_infinite_limit(n_history, max_val=total_blocks)
 
-            # Evaluate and compare only if both models have established stable tracking
+            # Stage 1: Active Divergence Abort Check
+            if (len(lo_history) >= 6) and (lo_est is None or n_est is None):
+                print(f"    - [EARLY ABORT] System instability detected (Divergent AR(2) coefficients). Halting sweep.")
+                break
+
             if lo_est is not None and n_est is not None:
-                # Log raw, unrounded floating point values to protect precision
-                print(f"    > Current Projection L(n): LO={safe_float(lo_est)} (est. {lo_steps} iters) | "
-                      f"n={safe_float(n_est)} (est. {n_steps} iters)")
+                # Stage 2: Lyapunov Energy Monotonicity Check
+                e_curr_lo = lo_history[-1] - lo_est
+                e_prev_lo = lo_history[-2] - lo_est
+                energy_lo = (e_curr_lo ** 2) - (lo_A2 * (e_prev_lo ** 2))
 
-                # Perform Banker's rounded comparison for early-exit evaluation
+                if prev_energy_lo is not None and energy_lo > prev_energy_lo:
+                    if energy_lo / prev_energy_lo > 1.05:  # Abort if energy gain exceeds a 5% noise tolerance threshold
+                        print(
+                            f"    - [EARLY ABORT] Lyapunov Energy violation (E_curr: {energy_lo:.4f} > E_prev: {prev_energy_lo:.4f}). System gaining entropy. Halting sweep.")
+                        break
+
+                prev_energy_lo = energy_lo
+
+                print(f"    > Current Projection L(n): LO={high_precision_float(lo_est)} (est. {lo_steps} iters) | "
+                      f"n={high_precision_float(n_est)} (est. {n_steps} iters)")
+
+                write_state_to_log(output_file, {
+                    "event": "projection",
+                    "lo_est": float(lo_est),
+                    "n_est": float(n_est)
+                })
+
                 lo_est_rounded = int(round(lo_est))
                 n_est_rounded = int(round(n_est))
 
                 if prev_extrapolated_lo is not None and prev_extrapolated_n is not None:
-                    # Apply Banker's rounding to the tracked raw floats
                     prev_lo_rounded = int(round(prev_extrapolated_lo))
                     prev_n_rounded = int(round(prev_extrapolated_n))
 
@@ -967,37 +965,30 @@ def profile_video_sweep(input_file, keep_intervals, width, height, output_file, 
                         converged_early = True
                         break
 
-                # Track exact floats in the buffer to avoid precision decay
                 prev_extrapolated_lo = lo_est
                 prev_extrapolated_n = n_est
             else:
-                # Accurate reporting during local acceleration states
                 print("    > Current Projection L(n): Gathering stable history (Extrapolation Unstable/Unavailable)")
-                # Reset buffers to prevent comparisons across discontinuous unstable phases
                 prev_extrapolated_lo = None
                 prev_extrapolated_n = None
 
-        # Track processing duration of this iteration
         iter_durations.append(time.time() - iter_start)
         iter_idx += 1
 
-        # ======================================================================
-        # --- DYNAMIC TERMINAL EXTENSION PROMPT ---
-        # ======================================================================
         if iter_idx >= max_iters_current and not converged_early:
             avg_dur = np.mean(iter_durations) if iter_durations else 15.0
-            
-            # Sound ANSI audio bell and print notification
+
             print("\a", end='', flush=True)
             print("\n" + "!" * 80)
             print("!!! ATTENTION: CALIBRATION ITERATIONS REACHED LIMIT WITHOUT CONVERGENCE !!!")
-            print(f"  > Terminal will pause for up to {safe_float(avg_dur)}s (average step duration) for response.")
+            print(
+                f"  > Terminal will pause for up to {format_hhmmss_decimal(avg_dur)} (average step duration) for response.")
             print("! Press Enter (with no input) to skip and finalize using the current state.")
             print("!" * 80 + "\n")
-            
+
             prompt = f"Enter additional iterations to run (or press Enter to skip): "
             user_input = timed_input(prompt, timeout=avg_dur)
-            
+
             if user_input is not None and user_input.strip().isdigit():
                 extend_by = int(user_input.strip())
                 if extend_by > 0:
@@ -1009,15 +1000,27 @@ def profile_video_sweep(input_file, keep_intervals, width, height, output_file, 
                 print("\n[RESUME] Finalizing calculations using current parameters...")
 
     # Final calculations using our pure AR(2) model
-    lo_extrapolated, _ = extrapolate_infinite_limit(lo_history, min_val=MIN_PHYSICAL_LO)
-    n_blocks_extrapolated, _ = extrapolate_infinite_limit(n_history, max_val=total_blocks)
+    lo_extrapolated, _, _, _ = extrapolate_infinite_limit(lo_history, min_val=MIN_PHYSICAL_LO)
+    n_blocks_extrapolated, _, _, _ = extrapolate_infinite_limit(n_history, max_val=total_blocks)
 
-    # Use the stable extrapolation if found; otherwise, fall back safely to the last empirical iteration (using Banker's rounding)
-    best_lo = int(round(lo_extrapolated)) if lo_extrapolated is not None else int(round(lo_history[-1]))
-    best_n = int(round(n_blocks_extrapolated)) if n_blocks_extrapolated is not None else int(round(n_history[-1]))
-    best_hi = min(float(MAX_PHYSICAL_HI), max(float(best_lo * 1.5), float(m_classes[2]))) if 'm_classes' in locals() else min(float(MAX_PHYSICAL_HI), max(float(best_lo * 1.5), 1000.0))
+    if converged_early:
+        print(f"\n  > Global Sequence Extrapolation Converged Successfully.")
+        best_lo = int(round(lo_extrapolated))
+        best_n = int(round(n_blocks_extrapolated))
+    else:
+        if lo_extrapolated is not None and n_blocks_extrapolated is not None:
+            print(
+                f"\n  > Calibration loop completed without full convergence (Using stable mathematical extrapolation limits).")
+            best_lo = int(round(lo_extrapolated))
+            best_n = int(round(n_blocks_extrapolated))
+        else:
+            print(
+                f"\n  > Calibration loop bypassed (Extrapolation Unstable/Unavailable). Finalizing with empirical parameters.")
+            best_lo = int(round(lo_history[-1]))
+            best_n = int(round(n_history[-1]))
 
-    print(f"\n  > Global Sequence Extrapolation Successful.")
+    # Strictly locked to physical maximum
+    best_hi = float(MAX_PHYSICAL_HI)
     print(f"  > Infinite-Limit Fixed Point: LO={best_lo}, HI={best_hi} (Locked), n={best_n}")
 
     separability = last_iter_metrics['separability']
@@ -1033,7 +1036,7 @@ def profile_video_sweep(input_file, keep_intervals, width, height, output_file, 
 
     print(f"\n--- Radiometric Optimization Results ---")
     print(
-        f"  > Optimal HI={best_hi}, LO={best_lo}, n={best_n} (FRAC={safe_float(mpdecimate_frac)}), Sep={safe_float(separability)}")
+        f"  > Optimal HI={best_hi}, LO={best_lo}, n={best_n} (FRAC={high_precision_float(mpdecimate_frac)}), Sep={high_precision_float(separability)}")
 
     return best_hi, best_lo, mpdecimate_frac, separability, omega_metric, phi_metric, norm_entropy, activity_log
 
@@ -1044,28 +1047,24 @@ def profile_video_sweep(input_file, keep_intervals, width, height, output_file, 
 
 def calculate_temporal_lookahead(merged_intervals, fps):
     """
-    Calculates the optimal x265 rate control lookahead buffer based on the
-    distribution of keeping-interval durations.
+    Calculates the optimal x265 rate control lookahead buffer based on keep intervals.
     """
     durations = np.array([(e - s) * fps for s, e in merged_intervals])
     if len(durations) < 3:
         return MAX_RC_LOOKAHEAD
 
-    # Use Otsu to isolate the primary structural clusters
     t1_t, _, t_sep, _, _ = perform_otsu_sweep(durations)
     signal_mask = durations > t1_t
     if t_sep < EPSILON or not np.any(signal_mask):
         return MAX_RC_LOOKAHEAD
 
-    # We set the lookahead equal to the mean duration of the active structural segments
     auto_lookahead_raw = np.mean(durations[signal_mask])
     return int(np.clip(round(auto_lookahead_raw), BFRAMES_LIMIT, MAX_RC_LOOKAHEAD))
 
 
 def export_trimmed_audio(input_file, output_wav_path, merged_intervals, total_sec):
     """
-    Extracts, resamples, and multiplexes the audio segments corresponding to the
-    keeping intervals into a unified, clean mono PCM-S16LE temporary WAV file.
+    Extracts, resamples, and multiplexes the audio segments into a unified WAV file.
     """
     container = av.open(input_file)
     a_stream = container.streams.audio[0]
@@ -1085,8 +1084,7 @@ def export_trimmed_audio(input_file, output_wav_path, merged_intervals, total_se
     with tqdm(total=total_sec + 1, unit="sec", desc="Muxing Audio") as pbar:
         for frame in container.decode(a_stream):
             ts = float(frame.pts * a_stream.time_base) if frame.pts is not None else 0.0
-            if ts < start_sec:
-                continue
+            if ts < start_sec: continue
 
             idx = bisect.bisect_right(starts, ts)
             if idx > 0 and ts <= merged_intervals[idx - 1][1]:
@@ -1109,101 +1107,82 @@ def export_trimmed_audio(input_file, output_wav_path, merged_intervals, total_se
 def run_pipeline():
     """
     Orchestrates the entire archival pipeline.
-
-    1. Sets up the stream redirection to capture logs cleanly.
-    2. Gathers general stream physics metadata (dimensions, frame rate).
-    3. Runs the voice-activity audio stats (or loads cached stats).
-    4. Runs the full-timeline global-extrapolation video profiling sweep (or loads cached stats).
-    5. Translates spatial-temporal metrics to x265 and mpdecimate variables.
-    6. Generates keeping-intervals and exports the consolidated mono WAV file.
-    7. Pipes the raw video frames corresponding to the keeping intervals directly
-       to FFmpeg, executing a veryslow x265 encode with customized visual parameters.
     """
     global START_TIME
     if len(sys.argv) < 4:
         print("Error: Missing execution arguments.")
-        print("Usage: python archiver_core.py <input_file> <output_file> <temp_audio_file> [start_time_seconds]")
+        print("Usage: python archiver_core.py <input_file> <output_file> <temp_audio_file> [start_time]")
         sys.exit(1)
 
     input_file, output_file, temp_audio_file = sys.argv[1], sys.argv[2], sys.argv[3]
 
-    # Dynamically read START_TIME if passed as a 4th argument from PowerShell
-    if len(sys.argv) >= 5:
-        try:
-            START_TIME = float(sys.argv[4])
-            print(f"  > Dynamic Override: START_TIME set to {safe_float(START_TIME)} seconds.")
-        except ValueError:
-            print(f"Warning: Invalid start_time argument '{sys.argv[4]}'. Defaulting to {safe_float(START_TIME)}.")
-
-    # --- Setup Logging Redirection & Log-based Resume Parser ---
+    # Pre-load log file to check for stored START_TIME and intervals
     log_file_path = output_file + ".log"
     parsed_log = parse_existing_log(log_file_path)
 
-    # Open log file in append mode if resuming, otherwise in overwrite mode
+    stored_start_time = 0.0
+    if parsed_log and 'start_time' in parsed_log:
+        stored_start_time = parsed_log['start_time']
+
+    # Resolve START_TIME (CLI argument takes precedence, otherwise prompts interactively)
+    if len(sys.argv) >= 5:
+        try:
+            START_TIME = parse_time_string_to_seconds(sys.argv[4])
+            print(f"  > CLI Override: START_TIME set to {seconds_to_time_string(START_TIME)} ({high_precision_float(START_TIME)} seconds).")
+        except ValueError:
+            print(f"Warning: Invalid start_time argument '{sys.argv[4]}'. Defaulting to 00:00.")
+            START_TIME = 0.0
+    else:
+        default_str = seconds_to_time_string(stored_start_time)
+        prompt_str = f"Enter start time (e.g., 21:25, 01:10:05, or raw seconds. Press Enter for {default_str}): "
+        print(prompt_str, end='', flush=True)
+        user_input = sys.stdin.readline().strip()
+        
+        if user_input:
+            try:
+                START_TIME = parse_time_string_to_seconds(user_input)
+                print(f"  > START_TIME set to {seconds_to_time_string(START_TIME)} ({high_precision_float(START_TIME)} seconds).")
+            except ValueError:
+                print(f"Warning: Invalid time format entered. Defaulting to {default_str}.")
+                START_TIME = stored_start_time
+        else:
+            START_TIME = stored_start_time
+            print(f"  > Using default START_TIME: {default_str} ({high_precision_float(START_TIME)} seconds).")
+
+    # Open log descriptor safely on resume. No Tee redirection means the log 
+    # file stays 100% clean, containing only structured #STATE JSON entries.
     log_mode = 'w'
     if parsed_log:
+        log_mode = 'a'
         if parsed_log['converged'] and parsed_log['merged'] is not None and parsed_log['total_sec'] is not None:
             print(f"[RESUME] Existing log converged at LO={parsed_log['final_lo']}, n={parsed_log['final_n']}. Bypassing calibration sweep.")
         else:
             print(f"[RESUME] Existing log has {len(parsed_log['history_lo'])} unconverged steps. Resuming sweep in append mode.")
-            log_mode = 'a'
 
-    try:
-        log_file = open(log_file_path, log_mode, encoding='utf-8')
-    except Exception as e:
-        print(f"Warning: Could not initiate log file at {log_file_path}: {e}")
-        log_file = None
-
-    # Save original references for clean stream restoration
-    original_stdout = sys.stdout
-    original_stderr = sys.stderr
-
-    if log_file:
-        sys.stdout = Tee(original_stdout, log_file, is_stderr=False)
-        sys.stderr = Tee(original_stderr, log_file, is_stderr=True)
-
-    # Track audio state for clean post-run destruction
     has_audio = False
 
     try:
-        # --- Stream Metadata Pre-Scan ---
-        # Fetch properties from input container metadata to avoid redundant initial opens.
+        # Pre-scan Stream Metadata
         container = av.open(input_file)
         v_stream = container.streams.video[0]
         fps = float(v_stream.average_rate) if v_stream.average_rate else 10.0
-        if fps <= 0:
-            fps = 10.0
+        if fps <= 0: fps = 10.0
         width = v_stream.width
         height = v_stream.height
         pix_fmt = v_stream.pix_fmt
         has_audio = len(container.streams.audio) > 0
         container.close()
 
-        # Check if direct loading from log file is active
-        use_cached = False
-        if parsed_log and parsed_log['converged'] and parsed_log['merged'] is not None and parsed_log['total_sec'] is not None:
-            use_cached = True
+        # Check and Load Cached Intervals
+        use_cached_intervals = False
+        if parsed_log and parsed_log['merged'] is not None and parsed_log['total_sec'] is not None:
+            use_cached_intervals = True
 
-        if use_cached:
-            # Unpack converged parameters directly from the parsed log file
+        if use_cached_intervals:
             merged = parsed_log['merged']
             total_sec = parsed_log['total_sec']
-            best_lo = parsed_log['final_lo']
-            best_n = parsed_log['final_n']
-            
-            # Reconstruct other metrics from log
-            if parsed_log['final_state']:
-                S_val, H_norm, Omega, Phi = parsed_log['final_state']
-            else:
-                S_val, H_norm, Omega, Phi = 0.85, 0.68, 0.003, 0.97
-                
-            best_hi = min(float(MAX_PHYSICAL_HI), max(float(best_lo * 1.5), 1000.0))
-            
-            # Get block counts for the frame piping loop
-            total_blocks = (width // 8) * (height // 8)
-            mpdecimate_frac = np.clip(best_n / total_blocks, EPSILON, 1.0)
-            
-            print(f"[RESUME] Loaded Converged State: LO={best_lo}, HI={best_hi}, n={best_n} (FRAC={safe_float(mpdecimate_frac)})")
+            print(f"[RESUME] Loaded cached intervals from log ({len(merged)} segments, {high_precision_float(total_sec)} total seconds). "
+                  f"Skipping Phase 1 (Audio Stats) and Phase 2 (Interval Generation).")
         else:
             if has_audio:
                 # --- Executing Phase 1 (Audio Stats) ---
@@ -1212,16 +1191,43 @@ def run_pipeline():
                 # --- Executing Phase 2 (Speech-Driven Keep Intervals) ---
                 merged = determine_intervals(audio_stats, total_sec, fps)
             else:
-                # Calculate total seconds directly from video metadata for audio-less streams
                 container = av.open(input_file)
                 total_sec = float(container.duration / av.time_base) if container.duration else 0.0
                 container.close()
                 merged = [(START_TIME if START_TIME else 0.0, total_sec)]
                 print(f"  > Keep Intervals: {merged}")
 
-            print(f"  > Total Duration: {safe_float(total_sec)} seconds")
+            # Serialize keep intervals and start time metadata
+            write_state_to_log(output_file, {
+                "event": "intervals",
+                "merged": [[to_mixed_fraction_string(s), to_mixed_fraction_string(e)] for s, e in merged],
+                "total_sec": total_sec,
+                "start_time": float(START_TIME) if START_TIME else 0.0
+            })
 
-            # --- Executing Phase 3 (Unified Video Profiling & Radiometric Calibration) ---
+            print(f"  > Total Duration: {high_precision_float(total_sec)} seconds")
+
+        # --- Tier 2: Unified Video Profiling & Radiometric Calibration ---
+        use_cached_calibration = False
+        if parsed_log and parsed_log['converged']:
+            use_cached_calibration = True
+
+        if use_cached_calibration:
+            best_lo = parsed_log['final_lo']
+            best_n = parsed_log['final_n']
+            best_hi = float(MAX_PHYSICAL_HI)
+            
+            if parsed_log['final_state']:
+                S_val, H_norm, Omega, Phi = parsed_log['final_state']
+            else:
+                S_val, H_norm, Omega, Phi = 0.85, 0.68, 0.003, 0.97
+                
+            total_blocks = (width // 8) * (height // 8)
+            mpdecimate_frac = np.clip(best_n / total_blocks, EPSILON, 1.0)
+            
+            print(f"[RESUME] Loaded Converged State: LO={best_lo}, HI={best_hi}, n={best_n} (FRAC={high_precision_float(mpdecimate_frac)})")
+            activity_log = []
+        else:
             best_hi, best_lo, mpdecimate_frac, S_val, Omega, Phi, H_norm, activity_log = profile_video_sweep(
                 input_file, merged, width, height, output_file, parsed_log=parsed_log)
 
@@ -1229,14 +1235,12 @@ def run_pipeline():
         container = av.open(input_file)
         v_stream = container.streams.video[0]
 
-        # Enable multithreaded decoding
         v_stream.codec_context.thread_count = 0
         v_stream.codec_context.thread_type = "AUTO"
 
         auto_lookahead = calculate_temporal_lookahead(merged, fps)
         print(f"  > Temporal Result: Lookahead={auto_lookahead}")
 
-        # Export trimmed audio only if a valid track exists
         if has_audio:
             export_trimmed_audio(input_file, temp_audio_file, merged, total_sec)
 
@@ -1253,103 +1257,59 @@ def run_pipeline():
 
         io_buffer_size = bytes_per_frame * 64
 
-        # ======================================================================
-        # --- CODING-THEORETIC x265 PARAMETER MAPPINGS ---
-        # ======================================================================
-
-        # 1. DPB Limit / Reference Frames (ref)
-        # Based on geometric decay of static blocks over scene transition rate Omega.
-        # Bounded within 1 to 6 reference pictures (Strict H.265 specification ceiling
-        # for standard-compliant decoders when B-pyramid remains active).
         auto_ref = int(np.clip(np.round(S_val / (Omega + EPSILON)), 1, 6))
-
-        # 2. B-Frame Log-Odds Model (bframe-bias)
-        # Models the symmetric log-odds (logit) of temporal stability vs. change.
-        # Project log-odds via tanh to strictly match x265 bias bounds [-90, 100].
         b_stability_odds = (1.0 - Omega) / (Omega + EPSILON)
         b_bias_factor = np.tanh(np.log(b_stability_odds))
         auto_b_bias = int(np.clip(np.round(100.0 * b_bias_factor), -90, 100))
-
-        # 3. Dynamic B-Frame Allocations (bframes)
-        # Scales total consecutive B-frames from its ceiling of 16 down to a floor of 4,
-        # based on combined change rate and entropy.
         auto_bframes = int(np.clip(np.round(BFRAMES_LIMIT * (1.0 - (Omega * H_norm))), 4, BFRAMES_LIMIT))
-
-        # 4. State-Separability Scenecut Sensitivity (scenecut)
-        # Bounded relative contrast sensitivity for frame change checks, mapped to [10, 90].
         auto_scenecut = int(np.clip(np.round(100.0 * S_val), 10, 90))
-
-        # 5. Psychovisual Contrast Balance (psy-rd & psy-rdoq)
-        # Preserves crisp vector edges while suppressing psychovisual spend on chaotic noise.
         psi = Phi * (1.0 - H_norm)
         auto_psy_rd = round(float(5.0 * psi), 2)
         auto_psy_rdoq = round(float(auto_psy_rd * 0.5), 2)
-
-        # 6. Complementary Entropy Rate-Control (qcomp)
-        # Curves rate distortion towards constant QP for text slides and constant rate for noise.
-        # Clipped inside the standard x265 operational bounds [0.5, 0.95].
         auto_qcomp = round(float(np.clip(1.0 - H_norm, 0.5, 0.95)), 2)
-
-        # 7. Balanced Deblocking Filter Offsets (deblock)
-        # Linear projection of change entropy (smoothing need) vs visual contrast (sharpness need).
-        # Fully maps onto the standard loop filter offset range of [-6, 6].
         deblock_balance = H_norm - Phi
         auto_deblock_offset = int(np.clip(np.round(6.0 * deblock_balance), -6, 6))
-        # Note: Comma is used as separator inside x265-params to bypass colon parsing issues
         auto_deblock_str = f"{auto_deblock_offset},{auto_deblock_offset}"
-
-        # 8. Contrast-Preserving Adaptive Quantization (aq-strength)
-        # Protects smooth, flat vector backgrounds while bypassing random noise regions.
-        # Fully maps onto the standard AQ operating bounds of [0.0, 3.0].
         auto_aq_strength = round(float(np.clip(3.0 * Phi * (1.0 - H_norm), 0.0, 3.0)), 2)
-
-        # 9. Spatial-Temporal Edge Skip Tuning (tskip & rskip)
-        # - tskip: Enables transform skip (lossless 4x4 bypass) for flat vector blocks if change entropy is low.
-        # - rskip-edge: Early depth recursion skip percentage threshold. Mapped strictly inside standard [1, 10] bounds as an integer percentage.
         auto_tskip = 1 if H_norm < 0.35 else 0
         auto_rskip_edge = int(round(np.clip(1.0 + 9.0 * H_norm, 1.0, 100.0)))
 
-        # --- Calculated Spatial-Temporal Metrics ---
         print(f"\n--- Calculated Spatial-Temporal Metrics ---")
-        print(f"  > Visual Contrast Ratio (Phi):        {safe_float(Phi)}")
-        print(f"  > Macro-Change Probability (Omega):   {safe_float(Omega)}")
-        print(f"  > Otsu Separability (S_val):          {safe_float(S_val)}")
-        print(f"  > Normalized Change Entropy (H_norm): {safe_float(H_norm)}")
+        print(f"  > Visual Contrast Ratio (Phi):        {high_precision_float(Phi)}")
+        print(f"  > Macro-Change Probability (Omega):   {high_precision_float(Omega)}")
+        print(f"  > Otsu Separability (S_val):          {high_precision_float(S_val)}")
+        print(f"  > Normalized Change Entropy (H_norm): {high_precision_float(H_norm)}")
 
         print(f"\n--- Physically Calibrated x265 Parameters ---")
         print(f"  > Max Reference Frames (ref):         {auto_ref}")
         print(f"  > Max Consecutive B-Frames:           {auto_bframes}")
         print(f"  > B-Frame Bias (Odds Ratio):          {auto_b_bias}")
         print(f"  > Scenecut Sensitivity:               {auto_scenecut}")
-        print(f"  > Psychovisual RD strength:           {safe_float(auto_psy_rd)}")
-        print(f"  > Psychovisual RDOQ trellis strength: {safe_float(auto_psy_rdoq)}")
-        print(f"  > Rate Control qcomp (Curve Comp):    {safe_float(auto_qcomp)}")
+        print(f"  > Psychovisual RD strength:           {high_precision_float(auto_psy_rd)}")
+        print(f"  > Psychovisual RDOQ trellis strength: {high_precision_float(auto_psy_rdoq)}")
+        print(f"  > Rate Control qcomp (Curve Comp):    {high_precision_float(auto_qcomp)}")
         print(f"  > Deblock Filter Configuration:       deblock={auto_deblock_str}")
-        print(f"  > AQ Strength (Bias toward flats):    {safe_float(auto_aq_strength)}")
+        print(f"  > AQ Strength (Bias toward flats):    {high_precision_float(auto_aq_strength)}")
         print(f"  > Transform Skip (Lossless 4x4):      tskip={auto_tskip}")
-        print(f"  > Recursion Skip Edge Threshold:      rskip-edge-threshold={safe_float(auto_rskip_edge)}")
+        print(f"  > Recursion Skip Edge Threshold:      rskip-edge-threshold={high_precision_float(auto_rskip_edge)}")
         print(f"----------------------------------------------------\n")
 
-        # Configuration dict mapped strictly to the dynamic inputs
-        # Note: Dict keys are logical categories; joined with colons to map into FFmpeg's -x265-params CLI flag
         x265_cfg = {
             "Profile": f"ref={auto_ref}",
             "Analysis": f"rd=6:rskip=2:rskip-edge-threshold={auto_rskip_edge}:rdoq-level=1:tu-intra-depth=4:tu-inter-depth=4:tskip={auto_tskip}",
             "Motion": "max-merge=5:subme=7:weightb=1:hme=1:hme-search=star,star,star:analyze-src-pics=1",
-            "Intra": "strong-intra-smoothing=0:constrained-intra=1",  # Smooth off to keep vector text crisp
-            "Psy": f"psy-rd={safe_float(auto_psy_rd)}:psy-rdoq={safe_float(auto_psy_rdoq)}",
+            "Intra": "strong-intra-smoothing=0:constrained-intra=1",
+            "Psy": f"psy-rd={high_precision_float(auto_psy_rd)}:psy-rdoq={high_precision_float(auto_psy_rdoq)}",
             "GOP": f"open-gop=0:keyint=-1:min-keyint=0:scenecut={auto_scenecut}:hist-scenecut=1:rc-lookahead={auto_lookahead}:b-adapt=2:bframes={auto_bframes}:bframe-bias={auto_b_bias}:fades=1",
-            "RC": f"crf=30:aq-mode=4:aq-strength={safe_float(auto_aq_strength)}:qp-adaptation-range=6.0:aq-motion=1:qg-size=8:qcomp={safe_float(auto_qcomp)}",
-            "Filters": f"deblock={auto_deblock_str}:sao=0",  # SAO disabled to prevent ringing around letters
+            "RC": f"crf=30:aq-mode=4:aq-strength={high_precision_float(auto_aq_strength)}:qp-adaptation-range=6.0:aq-motion=1:qg-size=8:qcomp={high_precision_float(auto_qcomp)}",
+            "Filters": f"deblock={auto_deblock_str}:sao=0",
             "VUI": "repeat-headers=1:opt-qp-pps=1:opt-ref-list-length-pps=1:opt-cu-delta-qp=1"
         }
 
         print(f"\nPhase 4/4: Master Encode [x265 Veryslow 8-bit]")
 
-        # Configure mpdecimate with our converged, infinite-limit parameters
         v_filter = f"mpdecimate=hi={safe_float(best_hi)}:lo={safe_float(best_lo)}:frac={safe_float(mpdecimate_frac)},setpts=PTS-STARTPTS"
 
-        # Dynamically build FFmpeg input and output parameters depending on stream audio availability
         audio_inputs = ['-i', temp_audio_file] if has_audio else []
         audio_outputs = ['-c:a', 'libopus', '-b:a', AUDIO_BITRATE, '-ac', '1', '-vbr', 'on'] if has_audio else ['-an']
 
@@ -1367,57 +1327,42 @@ def run_pipeline():
             '-movflags', '+faststart', output_file
         ]
 
-        # Redirect standard warning/error outputs straight to the log descriptor to keep the terminal clean
-        process = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stderr=log_file if log_file else None)
+        process = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stderr=sys.stderr)
         buffered_stdin = io.BufferedWriter(process.stdin, buffer_size=io_buffer_size)
 
         start_sec = float(START_TIME) if START_TIME else 0.0
         first_start = merged[0][0] if merged else start_sec
         starts = [s for s, e in merged]
 
-        # Recalculate remaining frame counts to keep progression metrics accurate
         total_remaining_sec = max(0.0, total_sec - start_sec)
         v_total = int(total_remaining_sec * fps)
 
-        # --- Frame Piping Loop (Run-Length De-Noised Content-Adaptive Selection) ---
         h_blocks, w_blocks = height // 8, width // 8
         total_blocks = h_blocks * w_blocks
         best_n_blocks = int(round(mpdecimate_frac * total_blocks))
 
-        # Dynamic run tracking variables
         run_length = 0
         best_pixels = None
         best_score = float('inf')
         ref_frame_luma = None
 
         def get_cleanliness_score(luma_arr):
-            # Downsample array 16x (using a 4x spatial stride) for a massive piping speedup
             luma_arr = luma_arr[::4, ::4]
-            
-            # Compute horizontal and vertical gradients
             diff_h = np.abs(luma_arr[1:, :] - luma_arr[:-1, :])
             diff_w = np.abs(luma_arr[:, 1:] - luma_arr[:, :-1])
 
-            # 1. Dynamic Noise Threshold (derived from the video's calibrated block noise floor)
             t_noise = max(1.0, best_lo / 64.0)
-
-            # 2. Dynamic Edge Threshold (edges must reside significantly above the noise floor)
             t_edge = 6.0 * t_noise
-
-            # 3. Dynamic Regularization Scale (derived from global contrast ratio & change entropy)
             alpha = 0.1 * Phi * (1.0 - H_norm)
 
-            # Background Noise: Sub-pixel fluctuations, dither, mosquito noise
             noise_h_mask = (diff_h > 0) & (diff_h <= t_noise)
             noise_w_mask = (diff_w > 0) & (diff_w <= t_noise)
             noise_energy = (np.sum(diff_h[noise_h_mask]) + np.sum(diff_w[noise_w_mask])) / luma_arr.size
 
-            # Edge Sharpness: High-contrast boundaries of vector text and UI elements
             edge_h_mask = (diff_h >= t_edge)
             edge_w_mask = (diff_w >= t_edge)
             edge_energy = (np.sum(diff_h[edge_h_mask]) + np.sum(diff_w[edge_w_mask])) / luma_arr.size
 
-            # Combine: Minimize flat-area noise while Maximizing sharp edges. Lower score is cleaner!
             return noise_energy - (alpha * edge_energy)
 
         with tqdm(total=v_total, unit="frame", desc="Encoding") as pbar:
@@ -1425,18 +1370,13 @@ def run_pipeline():
 
             for frame in container.decode(v_stream):
                 ts = float(frame.pts * v_stream.time_base) if frame.pts is not None else 0.0
-                if ts < first_start:
-                    continue  # Safely fast-forward past keyframe boundaries to target seek start
+                if ts < first_start: continue
 
                 idx = bisect.bisect_right(starts, ts)
                 if idx > 0 and ts <= merged[idx - 1][1]:
-                    # 1. Decode the frame pixels to the target format exactly once
                     frame_pixels = frame.to_ndarray(format=pix_fmt)
-
-                    # 2. Extract luma directly from the decoded ndarray (no extra C-buffer parsing)
                     arr_luma = extract_luma_from_ndarray(frame_pixels, height, width)
 
-                    # Emulate mpdecimate logic to verify if a state change occurred
                     is_different = True
                     if ref_frame_luma is not None:
                         diff = np.abs(arr_luma - ref_frame_luma)
@@ -1450,22 +1390,18 @@ def run_pipeline():
                         else:
                             is_different = False
 
-                    # Score the current frame's visual cleanliness
                     score = get_cleanliness_score(arr_luma)
 
                     if is_different:
-                        # Flush the accumulated de-noised run to FFmpeg standard input
                         if run_length > 0 and best_pixels is not None:
                             for _ in range(run_length):
                                 buffered_stdin.write(memoryview(best_pixels))
 
-                        # Initialize a new static run (copy lazily only when selected)
                         run_length = 1
                         best_pixels = np.ascontiguousarray(frame_pixels)
                         best_score = score
                         ref_frame_luma = arr_luma
                     else:
-                        # Duplicate detected; increment run length and check if this frame is cleaner
                         run_length += 1
                         if score < best_score:
                             best_pixels = np.ascontiguousarray(frame_pixels)
@@ -1475,7 +1411,6 @@ def run_pipeline():
                 if pbar.format_dict['rate']:
                     pbar.set_postfix_str("Speed: " + str(safe_float(pbar.format_dict['rate'] / fps)) + "x")
 
-            # Flush the final trailing run after the decode loop completes
             if run_length > 0 and best_pixels is not None:
                 for _ in range(run_length):
                     buffered_stdin.write(memoryview(best_pixels))
@@ -1485,12 +1420,6 @@ def run_pipeline():
         container.close()
 
     finally:
-        sys.stdout = original_stdout
-        sys.stderr = original_stderr
-        if log_file:
-            log_file.close()
-            print(f"Log written to: {log_file_path}")
-
         # Clean up temporary WAV track safely from disk
         if 'temp_audio_file' in locals() and os.path.exists(temp_audio_file):
             try:
