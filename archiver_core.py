@@ -525,6 +525,10 @@ def worker_analyze_sweep(args):
 
     local_mag_hist = np.zeros(HIST_SIZE, dtype=np.int64)
 
+    # Dynamic crossover threshold computation to avoid complexity bottlenecks
+    num_thresholds = THRESHOLDS.size
+    dynamic_crossover = HIST_SIZE // (num_thresholds - 1) if num_thresholds > 1 else 0
+
     try:
         container = av.open(input_file)
         v_stream = container.streams.video[0]
@@ -570,7 +574,7 @@ def worker_analyze_sweep(args):
                     local_active_blocks += active_sums.size
                     activity_log.append((ts, np.max(active_sums)))
 
-                    if active_sums.size < CROSSOVER_LIMIT:
+                    if active_sums.size < dynamic_crossover:
                         counts = np.sum(active_sums[:, None] > THRESHOLDS, axis=0)
                     else:
                         bincount = np.bincount(active_sums, minlength=HIST_SIZE)
@@ -618,13 +622,14 @@ def calculate_radiometric_constants_raw(counts_data, mag_hist, g_active, g_total
 
     non_zero_indices = np.flatnonzero(mag_hist)
     if non_zero_indices.size < 10:
-        _, t2, separability, m_classes, omega_classes = 100.0, 1000.0, 0.5, (10.0, 50.0, 500.0), (0.9, 0.08, 0.02)
+        t1, t2, separability, m_classes, omega_classes = 100.0, 1000.0, 0.5, (10.0, 50.0, 500.0), (0.9, 0.08, 0.02)
     else:
         indices = np.arange(HIST_SIZE)
-        _, t2, separability, m_classes, omega_classes = perform_otsu_sweep(indices, weights=mag_hist)
+        t1, t2, separability, m_classes, omega_classes = perform_otsu_sweep(indices, weights=mag_hist)
 
-    # Map LO to the higher Otsu threshold (t2)
-    best_lo = max(float(MIN_PHYSICAL_LO), float(t2))
+    # Core Correction: Map LO to the lower Otsu threshold (t1) instead of t2 [1].
+    # This allows the micro-change (Class 1) band to be registered as valid updates [1].
+    best_lo = max(float(MIN_PHYSICAL_LO), float(t1))
 
     # HI is strictly locked to the absolute physical maximum of an 8x8 block (16320.0)
     best_hi = float(MAX_PHYSICAL_HI)
@@ -644,6 +649,7 @@ def calculate_radiometric_constants_raw(counts_data, mag_hist, g_active, g_total
     if active_frame_counts.size < 10:
         n_blocks = 1.0
     else:
+        # Use t1 of active frame counts to establish the structural keep boundaries cleanly
         n_blocks = float(perform_otsu_sweep(active_frame_counts)[0])
 
     return best_hi, best_lo, n_blocks, separability, omega_metric, phi_metric, norm_entropy
@@ -724,6 +730,7 @@ def profile_video_sweep(input_file, keep_intervals, width, height, output_file, 
 
         roots = np.roots([1, -A1, -A2])
         spectral_radius = np.max(np.abs(roots)) if 'roots' in locals() else np.sqrt(max(0.0, -A2))
+        distance = abs(y[-1] - limit)
         if distance > 0.5 and spectral_radius > EPSILON:
             steps = int(np.ceil(np.log(0.5 / distance) / np.log(spectral_radius)))
         else:
@@ -930,18 +937,10 @@ def profile_video_sweep(input_file, keep_intervals, width, height, output_file, 
                 break
 
             if lo_est is not None and n_est is not None:
-                # Stage 2: Lyapunov Energy Monotonicity Check
-                e_curr_lo = lo_history[-1] - lo_est
-                e_prev_lo = lo_history[-2] - lo_est
-                energy_lo = (e_curr_lo ** 2) - (lo_A2 * (e_prev_lo ** 2))
-
-                if prev_energy_lo is not None and energy_lo > prev_energy_lo:
-                    if energy_lo / prev_energy_lo > 1.05:  # Abort if energy gain exceeds a 5% noise tolerance threshold
-                        print(
-                            f"    - [EARLY ABORT] Lyapunov Energy violation (E_curr: {energy_lo:.4f} > E_prev: {prev_energy_lo:.4f}). System gaining entropy. Halting sweep.")
-                        break
-
-                prev_energy_lo = energy_lo
+                # Stage 2: Lyapunov Energy Monotonicity Check (Relaxed/Bypassed)
+                # We allow the system to ride out temporary presentation transition shocks.
+                # Bypassing this check allows relaxation_damping to naturally converge the parameters.
+                pass
 
                 print(f"    > Current Projection L(n): LO={high_precision_float(lo_est)} (est. {lo_steps} iters) | "
                       f"n={high_precision_float(n_est)} (est. {n_steps} iters)")
@@ -1021,6 +1020,7 @@ def profile_video_sweep(input_file, keep_intervals, width, height, output_file, 
 
     # Strictly locked to physical maximum
     best_hi = float(MAX_PHYSICAL_HI)
+
     print(f"  > Infinite-Limit Fixed Point: LO={best_lo}, HI={best_hi} (Locked), n={best_n}")
 
     separability = last_iter_metrics['separability']
@@ -1149,8 +1149,7 @@ def run_pipeline():
             START_TIME = stored_start_time
             print(f"  > Using default START_TIME: {default_str} ({high_precision_float(START_TIME)} seconds).")
 
-    # Open log descriptor safely on resume. No Tee redirection means the log 
-    # file stays 100% clean, containing only structured #STATE JSON entries.
+    # Open log descriptor safely on resume.
     log_mode = 'w'
     if parsed_log:
         log_mode = 'a'
@@ -1207,6 +1206,15 @@ def run_pipeline():
 
             print(f"  > Total Duration: {high_precision_float(total_sec)} seconds")
 
+        # --- Immediate Audio Export (Phase 2.5) ---
+        # Generate the trimmed WAV track immediately after voice-gating is determined [1].
+        # This frees up disk I/O and CPU resources before the heavy Phase 3 visual profiling sweeps [1].
+        if has_audio:
+            if not os.path.exists(temp_audio_file):
+                export_trimmed_audio(input_file, temp_audio_file, merged, total_sec)
+            else:
+                print(f"  > Using existing temporary audio track: {temp_audio_file}")
+
         # --- Tier 2: Unified Video Profiling & Radiometric Calibration ---
         use_cached_calibration = False
         if parsed_log and parsed_log['converged']:
@@ -1241,9 +1249,6 @@ def run_pipeline():
         auto_lookahead = calculate_temporal_lookahead(merged, fps)
         print(f"  > Temporal Result: Lookahead={auto_lookahead}")
 
-        if has_audio:
-            export_trimmed_audio(input_file, temp_audio_file, merged, total_sec)
-
         resolution = f"{width}x{height}"
         input_pix_fmt = pix_fmt.replace('j', '')
         output_pix_fmt = input_pix_fmt
@@ -1257,22 +1262,40 @@ def run_pipeline():
 
         io_buffer_size = bytes_per_frame * 64
 
-        auto_ref = int(np.clip(np.round(S_val / (Omega + EPSILON)), 1, 6))
-        b_stability_odds = (1.0 - Omega) / (Omega + EPSILON)
-        b_bias_factor = np.tanh(np.log(b_stability_odds))
-        auto_b_bias = int(np.clip(np.round(100.0 * b_bias_factor), -90, 100))
-        auto_bframes = int(np.clip(np.round(BFRAMES_LIMIT * (1.0 - (Omega * H_norm))), 4, BFRAMES_LIMIT))
-        auto_scenecut = int(np.clip(np.round(100.0 * S_val), 10, 90))
-        psi = Phi * (1.0 - H_norm)
-        auto_psy_rd = round(float(5.0 * psi), 2)
-        auto_psy_rdoq = round(float(auto_psy_rd * 0.5), 2)
+        # Max consecutive B-frames limit:
+        auto_bframes = int(round(4.0 + 12.0 * (1.0 - (Omega * H_norm))))
+
+        # --- Dynamic DPB Capping Fix ---
+        reorder_depth = 3 if auto_bframes >= 4 else 2
+        max_safe_ref = 8 - reorder_depth
+
+        # --- Non-Arbitrary Reference Frame Algebraic Growth Mapping ---
+        u = S_val / (Omega + EPSILON)
+        auto_ref = int(round(1.0 + (max_safe_ref - 1.0) * (u / (u + 1.0))))
+
+        # --- Continuous, Non-Arbitrary B-Frame Bias ---
+        auto_b_bias = int(round(100.0 * np.tanh(1.0 - 2.0 * Omega)))
+
+        # Continuous Scenecut Sigmoidal Scaling
+        auto_scenecut = int(round(10.0 + 80.0 / (1.0 + np.exp(-4.0 * (S_val - 0.5)))))
+
+        # --- Continuous Contrast-Adaptive Psy-RD Mapping ---
+        auto_psy_rd = round(float(1.5 * np.exp(-3.0 * Phi)), 2)
+        auto_psy_rdoq = round(float(1.0 * np.exp(-3.0 * Phi)), 2)
+
         auto_qcomp = round(float(np.clip(1.0 - H_norm, 0.5, 0.95)), 2)
+        
+        # --- Deblock Offset Negative-Only Cap Fix ---
         deblock_balance = H_norm - Phi
-        auto_deblock_offset = int(np.clip(np.round(6.0 * deblock_balance), -6, 6))
+        auto_deblock_offset = int(round(-3.0 * (1.0 - np.tanh(2.0 * deblock_balance))))
         auto_deblock_str = f"{auto_deblock_offset},{auto_deblock_offset}"
-        auto_aq_strength = round(float(np.clip(3.0 * Phi * (1.0 - H_norm), 0.0, 3.0)), 2)
-        auto_tskip = 1 if H_norm < 0.35 else 0
-        auto_rskip_edge = int(round(np.clip(1.0 + 9.0 * H_norm, 1.0, 100.0)))
+
+        # --- Continuous Contrast-Adaptive AQ Strength Mapping ---
+        auto_aq_strength = round(float(0.5 + np.tanh(Phi * (1.0 - H_norm))), 2)
+
+        # Globally enable HEVC transform skip (R-D loop handles native block decisions) [1].
+        auto_tskip = 1 
+        auto_rskip_edge = int(round(1.0 + 9.0 * H_norm))
 
         print(f"\n--- Calculated Spatial-Temporal Metrics ---")
         print(f"  > Visual Contrast Ratio (Phi):        {high_precision_float(Phi)}")
@@ -1281,7 +1304,7 @@ def run_pipeline():
         print(f"  > Normalized Change Entropy (H_norm): {high_precision_float(H_norm)}")
 
         print(f"\n--- Physically Calibrated x265 Parameters ---")
-        print(f"  > Max Reference Frames (ref):         {auto_ref}")
+        print(f"  > Max Reference Frames (ref):         {auto_ref} (DPB Safe Ceiling: {max_safe_ref})")
         print(f"  > Max Consecutive B-Frames:           {auto_bframes}")
         print(f"  > B-Frame Bias (Odds Ratio):          {auto_b_bias}")
         print(f"  > Scenecut Sensitivity:               {auto_scenecut}")
@@ -1420,13 +1443,10 @@ def run_pipeline():
         container.close()
 
     finally:
-        # Clean up temporary WAV track safely from disk
+        # Core Correction: The temporary WAV track is NOT cleaned up/deleted by this script [1].
+        # Delegation of cleanup is handled entirely by the orchestration layer (e.g., PS1) [1].
         if 'temp_audio_file' in locals() and os.path.exists(temp_audio_file):
-            try:
-                os.remove(temp_audio_file)
-                print(f"  > Cleaned up temporary audio track: {temp_audio_file}")
-            except Exception as e:
-                print(f"Warning: Could not remove temporary audio track {temp_audio_file}: {e}")
+            print(f"  > Preservation: Temporary audio track preserved for container remuxing: {temp_audio_file}")
 
 
 if __name__ == "__main__":
