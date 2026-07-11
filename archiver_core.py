@@ -262,6 +262,9 @@ def parse_existing_log(log_file_path):
         total_sec_val = None
         start_time_val = 0.0
         
+        # State-driven finalization checker
+        finalized_data = None
+        
         with open(log_file_path, 'r', encoding='utf-8') as f:
             for line in f:
                 if line.strip().startswith("#STATE:"):
@@ -281,9 +284,26 @@ def parse_existing_log(log_file_path):
                             state_matches.append(data['state'])
                         elif data['event'] == 'projection':
                             projections.append((data['lo_est'], data['n_est']))
+                        elif data['event'] == 'finalized':
+                            finalized_data = data
                     except Exception:
                         pass
                         
+        # 1. State-Driven Load: Bypasses the sweep if the previous run concluded successfully [1]
+        if finalized_data is not None:
+            return {
+                'history_lo': history_lo,
+                'history_n': history_n,
+                'converged': True,
+                'final_lo': finalized_data['best_lo'],
+                'final_n': finalized_data['best_n'],
+                'final_state': finalized_data['state'],
+                'merged': merged_list,
+                'total_sec': total_sec_val,
+                'start_time': start_time_val
+            }
+            
+        # 2. Fallback: Post-hoc projection-matching for backward-compatibility with old logs [1]
         if history_lo:
             converged = False
             final_lo, final_n = None, None
@@ -815,6 +835,7 @@ def profile_video_sweep(input_file, keep_intervals, width, height, output_file, 
 
     prev_extrapolated_lo = None
     prev_extrapolated_n = None
+    prev_area_lo = None  # Persistent storage for Symplectic Area Monotonicity [1]
     hi = float(MAX_PHYSICAL_HI)  # Locked to physical maximum for workers
     max_iters_current = 24
     relaxation_damping = 2.0 / 3.0
@@ -832,9 +853,7 @@ def profile_video_sweep(input_file, keep_intervals, width, height, output_file, 
         'g_frm': 0
     }
 
-    # Initialized before loop to act as persistent state flag
     converged_early = False
-    prev_energy_lo = None
 
     iter_idx = start_iter_idx
     while iter_idx < max_iters_current:
@@ -928,19 +947,30 @@ def profile_video_sweep(input_file, keep_intervals, width, height, output_file, 
         )
 
         if len(lo_history) >= 5:
+            # Full history is passed; the Lsq solver will naturally resolve stability once the stable tail dominates [1].
             lo_est, lo_steps, lo_A1, lo_A2 = extrapolate_infinite_limit(lo_history, min_val=MIN_PHYSICAL_LO)
             n_est, n_steps, n_A1, n_A2 = extrapolate_infinite_limit(n_history, max_val=total_blocks)
 
-            # Stage 1: Active Divergence Abort Check
-            if (len(lo_history) >= 6) and (lo_est is None or n_est is None):
-                print(f"    - [EARLY ABORT] System instability detected (Divergent AR(2) coefficients). Halting sweep.")
-                break
-
             if lo_est is not None and n_est is not None:
-                # Stage 2: Lyapunov Energy Monotonicity Check (Relaxed/Bypassed)
-                # We allow the system to ride out temporary presentation transition shocks.
-                # Bypassing this check allows relaxation_damping to naturally converge the parameters.
-                pass
+                # --- Equivalent 4: Symplectic Phase-Space Area Monotonicity ---
+                e_t = lo_history[-1] - lo_est
+                e_t_minus_1 = lo_history[-2] - lo_est
+                e_t_minus_2 = lo_history[-3] - lo_est
+                
+                # Compute signed orbit area (determinant of the orbit) [1]
+                area_lo = (e_t_minus_1 ** 2) - (e_t * e_t_minus_2)
+                print(f"    > Symplectic Area: {high_precision_float(area_lo)}")
+                
+                # Check for Phase-Space Area Monotonicity Violation [1]
+                if prev_area_lo is not None:
+                    # If the area expands or becomes non-positive, we have hit the noise floor [1].
+                    # The trajectory is no longer spiraling; it is jittering randomly. Halting early [1].
+                    if area_lo >= prev_area_lo or area_lo <= 0:
+                        print(f"    - [EARLY STOP] Phase space area ceased contracting (Area_t: {area_lo:.4f} >= Area_prev: {prev_area_lo:.4f}). "
+                              f"Noise floor reached. Halting sweep.")
+                        break
+                
+                prev_area_lo = area_lo
 
                 print(f"    > Current Projection L(n): LO={high_precision_float(lo_est)} (est. {lo_steps} iters) | "
                       f"n={high_precision_float(n_est)} (est. {n_steps} iters)")
@@ -967,6 +997,7 @@ def profile_video_sweep(input_file, keep_intervals, width, height, output_file, 
                 prev_extrapolated_lo = lo_est
                 prev_extrapolated_n = n_est
             else:
+                # Non-blocking state reporter during noisy transient iterations [1]
                 print("    > Current Projection L(n): Gathering stable history (Extrapolation Unstable/Unavailable)")
                 prev_extrapolated_lo = None
                 prev_extrapolated_n = None
@@ -1020,7 +1051,6 @@ def profile_video_sweep(input_file, keep_intervals, width, height, output_file, 
 
     # Strictly locked to physical maximum
     best_hi = float(MAX_PHYSICAL_HI)
-
     print(f"  > Infinite-Limit Fixed Point: LO={best_lo}, HI={best_hi} (Locked), n={best_n}")
 
     separability = last_iter_metrics['separability']
@@ -1030,6 +1060,14 @@ def profile_video_sweep(input_file, keep_intervals, width, height, output_file, 
     activity_log = last_iter_metrics['activity_log']
     g_tot = last_iter_metrics['g_tot']
     g_frm = last_iter_metrics['g_frm']
+
+    # Log finalization state to permit clean direct loading on subsequent executions [1]
+    write_state_to_log(output_file, {
+        "event": "finalized",
+        "best_lo": int(best_lo),
+        "best_n": int(best_n),
+        "state": [float(separability), float(norm_entropy), float(omega_metric), float(phi_metric)]
+    })
 
     total_blocks_per_frame = (g_tot / g_frm) if g_frm > 0 else 1
     mpdecimate_frac = np.clip(best_n / total_blocks_per_frame, EPSILON, 1.0)
@@ -1324,7 +1362,7 @@ def run_pipeline():
             "Intra": "strong-intra-smoothing=0:constrained-intra=1",
             "Psy": f"psy-rd={high_precision_float(auto_psy_rd)}:psy-rdoq={high_precision_float(auto_psy_rdoq)}",
             "GOP": f"open-gop=0:keyint=-1:min-keyint=0:scenecut={auto_scenecut}:hist-scenecut=1:rc-lookahead={auto_lookahead}:b-adapt=2:bframes={auto_bframes}:bframe-bias={auto_b_bias}:fades=1",
-            "RC": f"crf=30:aq-mode=4:aq-strength={high_precision_float(auto_aq_strength)}:qp-adaptation-range=6.0:aq-motion=1:qg-size=8:qcomp={high_precision_float(auto_qcomp)}",
+            "RC": f"aq-mode=4:aq-strength={high_precision_float(auto_aq_strength)}:qp-adaptation-range=6.0:aq-motion=1:qg-size=8:qcomp={high_precision_float(auto_qcomp)}",
             "Filters": f"deblock={auto_deblock_str}:sao=0",
             "VUI": "repeat-headers=1:opt-qp-pps=1:opt-ref-list-length-pps=1:opt-cu-delta-qp=1"
         }
@@ -1342,7 +1380,7 @@ def run_pipeline():
             '-i', 'pipe:0'
         ] + audio_inputs + [
             '-vf', v_filter,
-            '-c:v', 'libx265', '-preset', 'veryslow', '-x265-params', ":".join(x265_cfg.values()),
+            '-c:v', 'libx265', '-preset', 'placebo', '-x265-params', ":".join(x265_cfg.values()),
             '-profile:v', 'main', '-pix_fmt', output_pix_fmt, '-color_range', 'pc', '-colorspace', 'bt709',
             '-color_primaries', 'bt709', '-color_trc', 'iec61966-2-1',
         ] + audio_outputs + [
