@@ -1,96 +1,96 @@
-# Adaptive Screen Content Video Compressor
+# adaptive-screen-content-video-compressor
 
-An automated, data-driven screen recording archival pipeline. It dynamically analyzes video frames and speech activity to perform content-adaptive, high-efficiency x265 compression while retaining structural readability.
-
-The pipeline operates by modeling the physical and statistical properties of active video segments, adjusting video encoding parameters to stay within the limits of standard HEVC Main Profile decoders.
+A physical, data-driven screen recording archival pipeline [1].
 
 ---
 
 ## Design Philosophy: Standard-Compliant Screen Content Emulation
 
-While H.265 contains a dedicated Screen Content Coding (SCC) extension, standard consumer hardware decoders often do not support it, and custom builds of x265 are frequently required to enable it. 
-
-This project emulates the visual benefits of SCC while remaining strictly compliant with the standard H.265 Main Profile. By evaluating spatial-temporal change entropy, the pipeline dynamically maps standard parameters to match the unique characteristics of screen captures (e.g., sharp text, flat background geometry, low temporal motion).
+Unlike traditional encoders that rely on hardcoded presets or arbitrary static boundaries, this pipeline dynamically analyzes video frames, extracts physical and statistical properties, and maps them onto standard-compliant H.265 (HEVC) parameters [1]. The entire encoding process is self-optimizing and continuously variable, letting the underlying mathematics of the video signal drive the output parameters without heuristics [1].
 
 ---
 
 ## Technical Architecture & Coding-Theoretic Mapping
 
-Every visual and temporal encoding parameter in this pipeline is dynamically calculated from the statistical properties of active audiovisual segments:
+Instead of arbitrary thresholds or hard clipping cliffs, the pipeline maps continuous spatial-temporal metrics ($H_{\text{norm}}$, $\Omega$, $\Phi$, $S_{\text{val}}$) directly onto standard H.265 (x265) parameters using smooth, self-bounding mathematical functions [1]:
 
 ### 1. Reference Picture Buffer Boundaries (`ref`)
-- **Limitation:** In the standard HEVC Main Profile, the Decoded Picture Buffer (DPB) is capped at 8 references. Because B-pyramid remains active, the pipeline limits the maximum L0 reference frames to 6. This restriction prevents playback failures or hardware decoder memory overflow on consumer chipsets.
-- **Dynamic Derivation:** The reference count scales inversely with the scene transition rate ($\Omega$), mapping the geometric decay of static blocks onto a range of `[1, 6]`.
+The Decoded Picture Buffer (DPB) required for standard decoding is strictly constrained by HEVC specifications [1]:
+$$\text{DPB} = \text{ref} + \text{reorder\_depth} \le 8$$
+Where the reorder depth is dynamically computed based on the B-frame structure (3 frames for $\text{bframes} \ge 4$ under a B-pyramid, 2 frames for $\text{bframes} < 4$) to prevent playback failures or hardware decoder memory overflow on consumer chipsets [1]. Max safe reference ceiling is $\text{max\_safe\_ref} = 8 - \text{reorder\_depth}$ [1].
+
+To allocate reference frames continuously without arbitrary clipping boundaries, we map the relative sequence stability $u = \frac{S_{\text{val}}}{\Omega + \epsilon}$ onto $[1, \text{max\_safe\_ref}]$ using an algebraic growth curve [1]:
+$$\text{ref} = 1 + (\text{max\_safe\_ref} - 1) \cdot \frac{u}{u + 1}$$
+As $\Omega \to 0$ (highly static screen state), references approach $\text{max\_safe\_ref}$ asymptotically. As $\Omega \to 1$ (chaotic motion), references decay smoothly to $1$.
 
 ### 2. B-Frame Allocations and Slicetype Bias
-- **Maximum B-Frames (`bframes`):** B-frames are scaled from a structural ceiling of 16 down to a floor of 4 based on combined change rate and entropy.
-- **Slicetype Bias (`bframe-bias`):** Employs a symmetric log-odds (logit) stability model to project temporal stability:
-  $$\text{Odds} = \frac{1.0 - \Omega}{\Omega + \epsilon}$$
-  The log-odds value is mapped via a hyperbolic tangent function ($\tanh$) and scaled to fit the `[-90, 100]` x265 CLI range to prevent driver warning states.
+* **Consecutive B-Frames (`bframes`):** B-frame structure is scaled continuously between $4$ and $16$ based on the joint spatial-temporal complexity metric $H_{\text{norm}} \cdot \Omega$ [1]:
+  $$\text{bframes} = 4 + 12 \cdot (1.0 - \Omega \cdot H_{\text{norm}})$$
+* **Slicetype Bias (`bframe-bias`):** Preference for B-frame decision is mapped continuously onto the standard $[-100, 100]$ range via a hyperbolic tangent centered on a neutral 50% transition rate [1]:
+  $$\text{bframe-bias} = 100 \cdot \tanh(1.0 - 2\Omega)$$
+  This guarantees that the bias safely scales between $+100$ (completely static) and $-100$ (constant temporal changes) without hitting arbitrary clamping cliffs [1].
 
 ### 3. Loop Filter Deblocking Offsets (`deblock`)
-- **Method:** Balances vector text sharpness against dither-noise smoothing by applying a linear projection of change entropy (which dictates smoothing needs) against visual contrast (which dictates sharpness needs).
-- **Mapping:** Maps the resulting balance across the physical range of `[-6, 6]`.
+Applying positive deblocking values to screen content blurs sharp vector text lines, destroying readability [1]. To enforce negative/neutral deblocking, we map the spatial-temporal balance $x = H_{\text{norm}} - \Phi$ continuously onto the safe window $(-6, 0)$ via a shifted hyperbolic tangent [1]:
+$$\text{deblock} = -3 \cdot \left(1.0 - \tanh(2x)\right)$$
+* As $x \to -\infty$ (high contrast, low entropy $\implies$ sharp text), deblocking approaches $-6$ (maximum sharpness).
+* As $x \to +\infty$ (low contrast, high entropy $\implies$ noisy textures), deblocking approaches $0$ (neutral).
 
 ### 4. Contrast-Preserving Adaptive Quantization (`aq-strength`)
-- **Method:** Maps spatial AQ strength dynamically to protect flat, clean vector backgrounds from banding and blockiness while preventing the encoder from wasting bitrate on high-frequency, randomized screen-capture noise.
-- **Mapping:** Scales across the standard `[0.0, 3.0]` range.
+Scaling spatial AQ strength to the standard ceiling of $3.0$ causes severe ringing noise around text boundaries. We continuously map the contrast-sparsity product onto the safe screen-content range of $[0.5, 1.5]$ using a hyperbolic tangent [1]:
+$$\text{aq-strength} = 0.5 + \tanh\left(\Phi \cdot (1.0 - H_{\text{norm}})\right)$$
+This naturally scales up to $1.5$ to protect solid backgrounds from banding only when the content is highly static and contrasty, and decays smoothly to $0.5$ for high-entropy content to prevent mosquito noise [1].
+
+### 5. Psychovisual RD and RDOQ (`psy-rd`, `psy-rdoq`)
+High psychovisual RD values inject artificial high-frequency texture noise into flat UI elements. We continuously suppress these tools on high-contrast vector boundaries ($\Phi \to 1$) and scale them up on soft camera textures ($\Phi \to 0$) using an exponential decay curve [1]:
+$$\text{psy-rd} = 1.5 \cdot e^{-3\Phi}$$
+$$\text{psy-rdoq} = 1.0 \cdot e^{-3\Phi}$$
+
+### 6. Transform Skip (`tskip`)
+Rather than using arbitrary binary threshold switches, the pipeline globally enables transform skip (`tskip = 1`) for screen content. This allows the HEVC rate-distortion optimization loop to natively evaluate and skip block-level discrete cosine transforms (DCT) where beneficial.
+
+### 7. Scenecut Sensitivity (`scenecut`)
+Otsu separability ($S_{\text{val}}$) is continuously mapped onto the safe search window of $(10, 90)$ via a logistic sigmoid centered at $0.5$ [1]:
+$$\text{scenecut} = 10 + \frac{80}{1.0 + e^{-4(S_{\text{val}} - 0.5)}}$$
 
 ---
 
 ## Mathematical Core & Algorithms
 
-The pipeline utilizes several analytical mathematical models to evaluate and compress visual screen content:
-
 ### 1. Three-Class Otsu Thresholding Sweep
-Traditional Otsu thresholding splits a probability density function (PDF) into two classes. This pipeline implements a **3-class Otsu sweep** that maximizes the between-class variance to separate frame changes into three mathematically distinct regions:
-- **Class 0 (Background Noise):** Captures sub-pixel luma fluctuations, dither noise, and sensor dither.
-- **Class 1 (Micro-Changes):** Isolates subtle UI changes such as cursor blinks, hovering indicators, or microphone activity.
-- **Class 2 (Macro-Changes):** Identifies actual structural updates (e.g., text typing, screen sliding, window transitions).
+To isolate digital rendering noise without interfering with structural updates, we partition the absolute frame difference histogram into three mathematically distinct regions: Class 0 (Background Noise), Class 1 (Micro-Changes, such as text reveals and cursor updates), and Class 2 (Macro-Changes, such as slide wipes) [1].
 
-This classification provides the structural probability ($\Omega$) and contrast ratio ($\Phi$) metrics used to tune the encoder parameters.
+* **Noise Ceiling Invariant (`best_lo`):** Instead of mapping the noise ceiling to the high-contrast threshold $t_2$, we map it strictly to the lower threshold **$t_1$** (which separates Class 0 from Class 1) [1]:
+  $$\text{best\_lo} = \max(\text{MIN\_PHYSICAL\_LO}, \text{t1})$$
+  This invariant ensures that Class 1 micro-changes are correctly preserved in the active frame-keep count, eliminating the need for presentation-specific branch logic [1].
+* **Macro-Boundary (`best_hi`):** Locked strictly to the physical maximum of an 8x8 block ($\text{MAX\_PHYSICAL\_HI} = 16320.0$) [1].
 
 ### 2. AR(2) Infinite-Limit Parameter Extrapolation
-During calibration sweeps, parameters such as the low block-sum threshold (`lo`) and minimum active block counts (`n`) can oscillate between iterations. To ensure mathematical convergence, the calibration engine monitors history states and projects parameter behavior to its infinite-limit fixed point using a second-order auto-regressive model with drift:
+Modeled as a second-order autoregressive process to project parameter behavior to its infinite-limit fixed point [1]:
 $$y_n = A_1 y_{n-1} + A_2 y_{n-2} + c + \epsilon$$
-
-- **Stability Check:** The characteristic equation roots ($z^2 - A_1 z - A_2 = 0$) are evaluated. If both roots lie strictly inside the complex unit circle, the system is deemed stable (handling both monotonic and damped-oscillating convergence).
-- **Exit Strategy:** The system early-exits when the projected infinite-limit fixed point rounds to the same integer values on consecutive sweeps, saving CPU cycles.
+Evaluates roots of the characteristic equation $z^2 - A_1 z - A_2 = 0$ [1]. If both roots lie strictly inside the complex unit circle, the system is deemed stable, and parameters converge to $y^* = c / (1 - A_1 - A_2)$ [1].
 
 ### 3. Algorithmic Complexity Crossover (Fast Threshold Counting)
-When evaluating changes across 8x8 pixel blocks, the engine must count how many blocks exceed various change thresholds. The pipeline implements a complexity-theory crossover optimization that switches between two mathematical models:
-1. **Broadcast Method ($N \times T$ complexity):** Evaluates $N$ active blocks against $T$ discrete thresholds.
-2. **Suffix-Sum Bincount Method ($N + M$ complexity):** Populates a deterministic bincount of size $M$ (16,321 possible block sums) and computes a suffix sum.
-
-The crossover point occurs exactly where the computational densities intersect:
-$$N = \frac{M}{T - 1}$$
-This solves to exactly **64 blocks** (`CROSSOVER_LIMIT`). If fewer than 64 blocks are active, the broadcast model runs; otherwise, the suffix-sum method is utilized, avoiding redundant comparisons.
+Evaluates performance boundaries: Broadcast ($N \times T$) vs Suffix-Sum Bincount ($N + M$) [1]. The complexity crossover limit is calculated dynamically at runtime based on the actual size of the threshold array ($T$), ensuring optimal execution paths with zero hardcoded bottlenecks [1]:
+$$\text{crossover\_limit} = \frac{\text{HIST\_SIZE}}{T - 1}$$
 
 ### 4. Gradient-Based Visual Cleanliness Scoring
-When duplicating repeated visual states across decimation intervals, the pipeline evaluates each candidate frame's spatial gradients to select the cleanest frame to write.
-- **Noise Energy:** Sums absolute horizontal and vertical pixel-to-pixel differences that fall below a dynamically calibrated noise threshold ($t_{\text{noise}} \le \frac{\text{best\_lo}}{64}$).
-- **Edge Energy:** Sums gradient changes that fall above a dynamic edge threshold ($t_{\text{edge}} \ge 6 \times t_{\text{noise}}$).
-- **Objective Score:** Employs a regularized minimization objective:
-  $$\text{Score} = \text{Noise Energy} - (\alpha \times \text{Edge Energy})$$
-  The frame with the lowest score (representing minimal sub-pixel noise and maximum edge sharpness) is preserved.
+Evaluates texture and noise energy on a decimation pass to preserve visual cleanliness [1]:
+$$\text{Score} = \text{Noise Energy} - (\alpha \times \text{Edge Energy})$$
+High-energy noise below $t_{\text{noise}} \le \text{best\_lo}/64$, high-frequency edges above $t_{\text{edge}} \ge 6 \times t_{\text{noise}}$ [1].
 
 ---
 
-## Speech-Driven Temporal Segmentation
+## Speech-Driven Temporal Segmentation & Audio Workflow
 
-To isolate and segment spoken portions of the audio track before video encoding:
-1. **Feature Extraction:** Decodes the audio track and extracts root-mean-square (RMS) energy, zero-crossing rate (ZCR), and spectral energy in the human speech band ($300\text{ Hz} - 4000\text{ Hz}$).
-2. **Adaptive Gate Determination:** Automatically establishes threshold limits using individual Otsu sweeps over the extracted audio feature profiles.
-3. **Margin Padding:** Segments are padded with configurable margins (`MARGIN_SECS`) to prevent clipping conversational speech before merging adjacent intervals.
+### 1. Feature Extraction
+Decodes the audio track and extracts root-mean-square (RMS) energy, zero-crossing rate (ZCR), and spectral energy in the human speech band ($300\text{ Hz} - 4000\text{ Hz}$) [1].
 
----
+### 2. Adaptive Gate
+Otsu sweeps over audio features to isolate active speech from ambient noise [1].
 
-## Installation & Usage
+### 3. Early Audio Export (Phase 2.5)
+To optimize resource allocation, the trimmed WAV track is generated immediately after Phase 2 (Interval Generation) finishes [1]. This decouples the audio-pipeline tasks, running disk-heavy audio exports early before the CPU is saturated by parallel visual sweep processes in Phase 3 [1].
 
-### 1. Requirements
-Ensure you have the following dependencies configured on your system:
-- **Python:** 3.8 or higher.
-- **FFmpeg:** Must be globally accessible via your system's path.
-- **Dependencies:** Install via the provided `requirements.txt`:
-  ```bash
-  pip install -r requirements.txt
+### 4. Preserved Cleanup Ownership
+Deletion of the intermediate WAV file is omitted from `archiver_core.py` and delegated to the orchestration layer (`archiver_pipeline.ps1`), preventing premature file removal before final `.mkv` to `.mp4` container remuxing [1].
