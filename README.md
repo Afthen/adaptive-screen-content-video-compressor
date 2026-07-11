@@ -16,12 +16,12 @@ Instead of arbitrary thresholds or hard clipping cliffs, the pipeline maps conti
 
 ### 1. Reference Picture Buffer Boundaries (`ref`)
 The Decoded Picture Buffer (DPB) required for standard decoding is strictly constrained by HEVC specifications [1]:
-$$\text{DPB} = \text{ref} + \text{reorder\_depth} \le 8$$
-Where the reorder depth is dynamically computed based on the B-frame structure (3 frames for $\text{bframes} \ge 4$ under a B-pyramid, 2 frames for $\text{bframes} < 4$) to prevent playback failures or hardware decoder memory overflow on consumer chipsets [1]. Max safe reference ceiling is $\text{max\_safe\_ref} = 8 - \text{reorder\_depth}$ [1].
+$$\text{DPB} = \text{ref} + \text{reorder depth} \le 8$$
+Where the reorder depth is dynamically computed based on the B-frame structure (3 frames for $\text{bframes} \ge 4$ under a B-pyramid, 2 frames for $\text{bframes} < 4$) to prevent playback failures or hardware decoder memory overflow on consumer chipsets [1]. Max safe reference ceiling is $\text{max safe ref} = 8 - \text{reorder depth}$ [1].
 
-To allocate reference frames continuously without arbitrary clipping boundaries, we map the relative sequence stability $u = \frac{S_{\text{val}}}{\Omega + \epsilon}$ onto $[1, \text{max\_safe\_ref}]$ using an algebraic growth curve [1]:
-$$\text{ref} = 1 + (\text{max\_safe\_ref} - 1) \cdot \frac{u}{u + 1}$$
-As $\Omega \to 0$ (highly static screen state), references approach $\text{max\_safe\_ref}$ asymptotically. As $\Omega \to 1$ (chaotic motion), references decay smoothly to $1$.
+To allocate reference frames continuously without arbitrary clipping boundaries, we map the relative sequence stability $u = \frac{S_{\text{val}}}{\Omega + \epsilon}$ onto $[1, \text{max safe ref}]$ using an algebraic growth curve [1]:
+$$\text{ref} = 1 + (\text{max safe ref} - 1) \cdot \frac{u}{u + 1}$$
+As $\Omega \to 0$ (highly static screen state), references approach $\text{max safe ref}$ asymptotically. As $\Omega \to 1$ (chaotic motion), references decay smoothly to $1$.
 
 ### 2. B-Frame Allocations and Slicetype Bias
 * **Consecutive B-Frames (`bframes`):** B-frame structure is scaled continuously between $4$ and $16$ based on the joint spatial-temporal complexity metric $H_{\text{norm}} \cdot \Omega$ [1]:
@@ -61,9 +61,9 @@ $$\text{scenecut} = 10 + \frac{80}{1.0 + e^{-4(S_{\text{val}} - 0.5)}}$$
 To isolate digital rendering noise without interfering with structural updates, we partition the absolute frame difference histogram into three mathematically distinct regions: Class 0 (Background Noise), Class 1 (Micro-Changes, such as text reveals and cursor updates), and Class 2 (Macro-Changes, such as slide wipes) [1].
 
 * **Noise Ceiling Invariant (`best_lo`):** Instead of mapping the noise ceiling to the high-contrast threshold $t_2$, we map it strictly to the lower threshold **$t_1$** (which separates Class 0 from Class 1) [1]:
-  $$\text{best\_lo} = \max(\text{MIN\_PHYSICAL\_LO}, \text{t1})$$
+  $$\text{best lo} = \max(\text{MIN PHYSICAL LO}, \text{t1})$$
   This invariant ensures that Class 1 micro-changes are correctly preserved in the active frame-keep count, eliminating the need for presentation-specific branch logic [1].
-* **Macro-Boundary (`best_hi`):** Locked strictly to the physical maximum of an 8x8 block ($\text{MAX\_PHYSICAL\_HI} = 16320.0$) [1].
+* **Macro-Boundary (`best_hi`):** Locked strictly to the physical maximum of an 8x8 block ($\text{MAX PHYSICAL HI} = 16320.0$) [1].
 
 ### 2. AR(2) Infinite-Limit Parameter Extrapolation
 Modeled as a second-order autoregressive process to project parameter behavior to its infinite-limit fixed point [1]:
@@ -72,12 +72,12 @@ Evaluates roots of the characteristic equation $z^2 - A_1 z - A_2 = 0$ [1]. If b
 
 ### 3. Algorithmic Complexity Crossover (Fast Threshold Counting)
 Evaluates performance boundaries: Broadcast ($N \times T$) vs Suffix-Sum Bincount ($N + M$) [1]. The complexity crossover limit is calculated dynamically at runtime based on the actual size of the threshold array ($T$), ensuring optimal execution paths with zero hardcoded bottlenecks [1]:
-$$\text{crossover\_limit} = \frac{\text{HIST\_SIZE}}{T - 1}$$
+$$\text{crossover limit} = \frac{\text{HIST SIZE}}{T - 1}$$
 
 ### 4. Gradient-Based Visual Cleanliness Scoring
 Evaluates texture and noise energy on a decimation pass to preserve visual cleanliness [1]:
 $$\text{Score} = \text{Noise Energy} - (\alpha \times \text{Edge Energy})$$
-High-energy noise below $t_{\text{noise}} \le \text{best\_lo}/64$, high-frequency edges above $t_{\text{edge}} \ge 6 \times t_{\text{noise}}$ [1].
+High-energy noise below $t_{\text{noise}} \le \text{best lo}/64$, high-frequency edges above $t_{\text{edge}} \ge 6 \times t_{\text{noise}}$ [1].
 
 ---
 
