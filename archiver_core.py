@@ -731,7 +731,7 @@ def profile_video_sweep(input_file, keep_intervals, width, height, output_file, 
 
         coeffs, _, rank, _ = np.linalg.lstsq(X, Y, rcond=None)
         if rank < 3:
-            return None, None, None, None
+            return None, None, A1, A2
 
         A1, A2, c = coeffs
 
@@ -835,7 +835,7 @@ def profile_video_sweep(input_file, keep_intervals, width, height, output_file, 
 
     prev_extrapolated_lo = None
     prev_extrapolated_n = None
-    prev_area_lo = None  # Persistent storage for Symplectic Area Monotonicity [1]
+    prev_area_joint = None  # Persistent storage for scale-invariant joint hypervolume [1]
     hi = float(MAX_PHYSICAL_HI)  # Locked to physical maximum for workers
     max_iters_current = 24
     relaxation_damping = 2.0 / 3.0
@@ -947,30 +947,40 @@ def profile_video_sweep(input_file, keep_intervals, width, height, output_file, 
         )
 
         if len(lo_history) >= 5:
-            # Full history is passed; the Lsq solver will naturally resolve stability once the stable tail dominates [1].
+            # Full history is passed; the Lsq solver resolves stability once the stable tail dominates [1].
             lo_est, lo_steps, lo_A1, lo_A2 = extrapolate_infinite_limit(lo_history, min_val=MIN_PHYSICAL_LO)
             n_est, n_steps, n_A1, n_A2 = extrapolate_infinite_limit(n_history, max_val=total_blocks)
 
             if lo_est is not None and n_est is not None:
-                # --- Equivalent 4: Symplectic Phase-Space Area Monotonicity ---
-                e_t = lo_history[-1] - lo_est
-                e_t_minus_1 = lo_history[-2] - lo_est
-                e_t_minus_2 = lo_history[-3] - lo_est
+                # --- Equivalent 4: Scale-Invariant Joint 4D Symplectic Hypervolume Contraction ---
                 
-                # Compute signed orbit area (determinant of the orbit) [1]
-                area_lo = (e_t_minus_1 ** 2) - (e_t * e_t_minus_2)
-                print(f"    > Symplectic Area: {high_precision_float(area_lo)}")
+                # Compute absolute LO orbit area [1]
+                e_t_lo = lo_history[-1] - lo_est
+                e_t_lo_minus_1 = lo_history[-2] - lo_est
+                e_t_lo_minus_2 = lo_history[-3] - lo_est
+                area_lo = abs((e_t_lo_minus_1 ** 2) - (e_t_lo * e_t_lo_minus_2))
                 
-                # Check for Phase-Space Area Monotonicity Violation [1]
-                if prev_area_lo is not None:
-                    # If the area expands or becomes non-positive, we have hit the noise floor [1].
-                    # The trajectory is no longer spiraling; it is jittering randomly. Halting early [1].
-                    if area_lo >= prev_area_lo or area_lo <= 0:
-                        print(f"    - [EARLY STOP] Phase space area ceased contracting (Area_t: {area_lo:.4f} >= Area_prev: {prev_area_lo:.4f}). "
+                # Compute absolute n orbit area [1]
+                e_t_n = n_history[-1] - n_est
+                e_t_n_minus_1 = n_history[-2] - n_est
+                e_t_n_minus_2 = n_history[-3] - n_est
+                area_n = abs((e_t_n_minus_1 ** 2) - (e_t_n * e_t_n_minus_2))
+                
+                # Calculate the joint hypervolume via scale-invariant product mapping [1]
+                area_joint = area_lo * area_n
+                print(f"    > Symplectic Area (LO): {high_precision_float(area_lo)}")
+                print(f"    > Symplectic Area (n) : {high_precision_float(area_n)}")
+                print(f"    > Joint Symplectic Area: {high_precision_float(area_joint)}")
+                
+                # Check for Joint Phase-Space Area Monotonicity Violation [1]
+                if prev_area_joint is not None:
+                    # If the joint volume expands or ceases contracting, the parameters have reached their stable noise floor [1].
+                    if area_joint >= prev_area_joint or area_joint <= 0:
+                        print(f"    - [EARLY STOP] Joint phase space area ceased contracting (Area_t: {area_joint:.4f} >= Area_prev: {prev_area_joint:.4f}). "
                               f"Noise floor reached. Halting sweep.")
                         break
                 
-                prev_area_lo = area_lo
+                prev_area_joint = area_joint
 
                 print(f"    > Current Projection L(n): LO={high_precision_float(lo_est)} (est. {lo_steps} iters) | "
                       f"n={high_precision_float(n_est)} (est. {n_steps} iters)")
